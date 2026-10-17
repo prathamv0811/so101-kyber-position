@@ -1,0 +1,12 @@
+{
+  "listen": "192.168.101.50",
+  "credentials": "credentials/server",
+  "command_port": 7445,
+  "port": "/dev/serial/by-id/REPLACE_WITH_FOLLOWER",
+  "follower_calibration": "calibration/follower.json",
+  "limits": "follower.local.json",
+  "cameras": {
+    "top": {"device": "/dev/v4l/by-id/REPLACE_WITH_LOGITECH", "port": 7446},
+    "wrist": {"device": "/dev/v4l/by-id/REPLACE_WITH_WRIST", "port": 7447}
+  }
+}

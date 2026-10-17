@@ -1,7 +1,7 @@
 """LeRobot SO-101 adapters with Kyber carrying all remote commands.
 
 Joint order: shoulder_pan, shoulder_lift, elbow_flex, wrist_flex, wrist_roll, gripper.
-Positions are calibrated servo register ticks, not radians or Cartesian poses.
+Motor I/O uses servo ticks; network positions are calibrated fractions 0..4095.
 """
 import argparse
 import json
@@ -13,6 +13,11 @@ import time
 from pathlib import Path
 
 JOINTS = ("shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper")
+
+
+def normalized_positions(raw, cal):
+    return [round(4095 * (position - motor["range_min"]) / (motor["range_max"] - motor["range_min"]))
+            for position, motor in zip(raw, cal)]
 
 
 class Bus:
@@ -129,7 +134,7 @@ def leader(args):
             positions = bus.positions()
             if any(not m["range_min"] <= p <= m["range_max"] for m, p in zip(cal, positions)):
                 raise RuntimeError("Leader outside its calibrated range")
-            print(json.dumps({"captured_unix_ns": captured, "positions": positions}), flush=True)
+            print(json.dumps({"captured_unix_ns": captured, "positions": normalized_positions(positions, cal)}), flush=True)
             deadline = max(deadline + period, time.monotonic())
             time.sleep(max(0, deadline - time.monotonic()))
     finally:
@@ -163,7 +168,7 @@ class PositionController:
     def target(self, sample, measured):
         now = time.monotonic()
         age = time.time_ns() - sample["received_unix_ns"]
-        if sample["version"] != 1 or not 0 <= age <= 100_000_000:
+        if sample["version"] != 2 or not 0 <= age <= 100_000_000:
             raise ValueError("Stale or unsupported receiver sample")
         if type(sample["seq"]) is not int or sample["seq"] <= self.previous_seq:
             raise ValueError("Duplicate/reordered sample")
@@ -227,11 +232,22 @@ def first_sample(timeout=30):
             raise ValueError("Receiver timestamp is in the future")
 
 
+def require_video(paths):
+    for path in paths:
+        data = json.loads(Path(path).read_text())
+        age = time.time_ns() - data["updated_unix_ns"]
+        if not (data["frames"] > 0 and 0 <= age <= 500_000_000):
+            raise RuntimeError(f"Camera stream stale or unavailable: {Path(path).name}")
+
+
 def drive(args):
     if not (args.enable_motion and args.attended):
         raise ValueError("Physical operation requires --attended --enable-motion")
     config = json.loads(Path(args.config).read_text())
-    lc, fc = calibration(args.leader_calibration), calibration(args.follower_calibration)
+    # The leader normalizes against its own LeRobot calibration before sending.
+    # The follower needs only its own physical calibration, not a file from the Mac.
+    lc = [{"range_min": 0, "range_max": 4095} for _ in JOINTS]
+    fc = calibration(args.follower_calibration)
     # Validate reviewed config before opening any hardware.
     if config.get("limits_reviewed") is not True:
         raise ValueError("Physical limits have not been reviewed")
@@ -243,11 +259,13 @@ def drive(args):
     try:
         bus.require_passive()
         verify_calibration(bus, fc)
-        print("Follower ready; waiting up to 30 seconds for the leader (torque off)", file=sys.stderr)
-        first = first_sample()
+        startup = getattr(args, "startup_timeout", 30)
+        print(f"Follower ready; waiting up to {startup:g} seconds for the leader (torque off)", file=sys.stderr)
+        first = first_sample(startup)
         initial = bus.positions()
         controller = PositionController(config, lc, fc, initial)
         controller.target(first, initial)  # Validate fresh input and anchor before torque.
+        require_video(getattr(args, "video_status", []))
         touched = True
         for motor, position in zip(bus.ids, initial):
             bus.write(motor, 42, position, 2)  # preload present position before torque-on
@@ -259,6 +277,7 @@ def drive(args):
         while True:
             sample = read_sample(0.2)
             targets = controller.target(sample, bus.positions())
+            require_video(getattr(args, "video_status", []))
             # A sample carries a server challenge bounded to 200 ms. Each hardware
             # cycle must finish within 100 ms; a local read/write fault ends the session.
             started = time.monotonic()
@@ -284,10 +303,14 @@ def main():
     follow = commands.add_parser("drive", help="Consume receiver NDJSON and follow with bounded relative motion")
     follow.add_argument("--port", required=True)
     follow.add_argument("--config", required=True)
-    follow.add_argument("--leader-calibration", required=True)
+    follow.add_argument("--leader-calibration", help="Legacy argument; v2 calibration remains on the leader")
     follow.add_argument("--follower-calibration", required=True)
     follow.add_argument("--attended", action="store_true")
     follow.add_argument("--enable-motion", action="store_true")
+    follow.add_argument("--video-status", type=Path, action="append", default=[],
+                        help="Require each local camera status file fresh within 500 ms")
+    follow.add_argument("--startup-timeout", type=float, default=30,
+                        help="Torque-off wait for first input; live watchdog remains 200 ms")
     args = parser.parse_args()
     # SIGTERM follows the same torque-off cleanup as Ctrl+C.
     def terminate(_signum, _frame):

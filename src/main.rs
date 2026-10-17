@@ -1,4 +1,5 @@
 mod media;
+mod tls;
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
 use kynput::{GamepadAxis, GamepadEvent, InputPacket, InputTarget, InputType, Payload};
@@ -13,7 +14,7 @@ use std::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-const ALPN: &[u8] = b"so101-kynput-position-v1";
+const ALPN: &[u8] = b"so101-kynput-position-v2";
 const FRAME_LEN: usize = 24 + 6 * 9;
 const DEADLINE: Duration = Duration::from_millis(200);
 const AXES: [GamepadAxis; 6] = [
@@ -37,24 +38,37 @@ enum Command {
     CameraServe {
         #[arg(long, default_value = "127.0.0.1:7446")]
         listen: SocketAddr,
-        #[arg(long)]
+        #[arg(long, default_value = "credentials/server")]
         credentials: PathBuf,
+        /// Encrypted private-LAN connection without credential files or peer identity verification.
+        #[arg(long)]
+        insecure_lan: bool,
+        #[arg(long)]
+        status_file: Option<PathBuf>,
     },
     /// Receive H.264 from the KyProto video channel; stdout is an Annex-B stream.
     CameraView {
         #[arg(long)]
         remote: SocketAddr,
-        #[arg(long)]
+        #[arg(long, default_value = "credentials/leader")]
         credentials: PathBuf,
+        /// Encrypted private-LAN connection without credential files or peer identity verification.
+        #[arg(long)]
+        insecure_lan: bool,
         #[arg(long, default_value = "so101-server")]
         server_name: String,
+        #[arg(long)]
+        status_file: Option<PathBuf>,
     },
     /// Receive one authenticated publisher; record positions, never open motors.
     Receive {
         #[arg(long, default_value = "127.0.0.1:7445")]
         listen: SocketAddr,
-        #[arg(long)]
+        #[arg(long, default_value = "credentials/server")]
         credentials: PathBuf,
+        /// Encrypted private-LAN connection without credential files or peer identity verification.
+        #[arg(long)]
+        insecure_lan: bool,
         #[arg(long)]
         output: PathBuf,
     },
@@ -62,8 +76,11 @@ enum Command {
     Publish {
         #[arg(long)]
         remote: SocketAddr,
-        #[arg(long)]
+        #[arg(long, default_value = "credentials/leader")]
         credentials: PathBuf,
+        /// Encrypted private-LAN connection without credential files or peer identity verification.
+        #[arg(long)]
+        insecure_lan: bool,
         #[arg(long, default_value = "so101-server")]
         server_name: String,
         #[arg(long)]
@@ -99,7 +116,7 @@ fn encode(challenge: u64, seq: u64, sample: &Sample) -> Result<Vec<u8>> {
     buf.extend(seq.to_be_bytes());
     buf.extend(sample.captured_unix_ns.to_be_bytes());
     for (axis, &position) in AXES.iter().zip(&sample.positions) {
-        // Project-specific virtual six-axis controller. Values preserve raw ticks exactly.
+        // Project-specific virtual six-axis controller. Values preserve calibrated 12-bit fractions exactly.
         // These packets are consumed by our receiver, never injected into an OS gamepad.
         let packet = InputPacket::new(
             InputTarget::Host,
@@ -175,25 +192,19 @@ fn transport() -> Arc<quinn::TransportConfig> {
     Arc::new(config)
 }
 
-async fn receive(listen: SocketAddr, credentials: &Path, output: &Path) -> Result<()> {
+async fn receive(
+    listen: SocketAddr,
+    credentials: &Path,
+    output: &Path,
+    insecure_lan: bool,
+) -> Result<()> {
     // Refuse overwrite; opening before accepting a client catches storage errors early.
     let mut journal = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(output)?;
-    let verifier =
-        rustls::server::WebPkiClientVerifier::builder(Arc::new(roots(credentials)?)).build()?;
-    let mut tls = rustls::ServerConfig::builder()
-        .with_client_cert_verifier(verifier)
-        .with_single_cert(
-            certs(&credentials.join("cert.pem"))?,
-            key(&credentials.join("key.pem"))?,
-        )?;
-    tls.alpn_protocols = vec![ALPN.to_vec()];
-    let mut config = quinn::ServerConfig::with_crypto(Arc::new(
-        quinn::crypto::rustls::QuicServerConfig::try_from(tls)?,
-    ));
-    config.transport = transport();
+    tls::address(listen, insecure_lan)?;
+    let config = tls::server(credentials, insecure_lan, ALPN)?;
     let endpoint = quinn::Endpoint::server(config, listen)?;
     eprintln!(
         "Listening on {} (record only; one publisher per session)",
@@ -201,6 +212,7 @@ async fn receive(listen: SocketAddr, credentials: &Path, output: &Path) -> Resul
     );
     let incoming = endpoint.accept().await.context("Listener closed")?;
     let raw = tokio::time::timeout(Duration::from_secs(5), incoming).await??;
+    tls::address(raw.remote_address(), insecure_lan)?;
     let conn = kynet::Connection::from(raw);
     let (mut send, mut recv) =
         tokio::time::timeout(Duration::from_secs(3), conn.accept_bi()).await??;
@@ -222,7 +234,7 @@ async fn receive(listen: SocketAddr, credentials: &Path, output: &Path) -> Resul
                 break Ok(());
             }
             let (new_seq, sample) = decode(&frame, challenge, seq)?;
-            let record = serde_json::json!({"version":1,"seq":new_seq,
+            let record = serde_json::json!({"version":2,"units":"calibrated_fraction_12bit","seq":new_seq,
                 "captured_unix_ns":sample.captured_unix_ns,"received_unix_ns":now_ns(),
                 "positions":sample.positions,"challenge_round_trip_ms":issued.elapsed().as_secs_f64()*1000.0});
             let line = serde_json::to_string(&record)?;
@@ -246,7 +258,9 @@ async fn publish(
     simulate: bool,
     seconds: Option<f64>,
     hz: u32,
+    insecure_lan: bool,
 ) -> Result<()> {
+    tls::address(remote, insecure_lan)?;
     ensure!(
         (10..=120).contains(&hz),
         "hz must be 10..120 to meet the watchdog deadline"
@@ -276,7 +290,7 @@ async fn publish(
                     let sample: Sample = serde_json::from_slice(&line)?;
                     ensure!(
                         sample.positions.iter().all(|&x| x <= 4095),
-                        "Invalid raw ticks"
+                        "Invalid calibrated fraction"
                     );
                     source_tx.send_replace(Some(sample));
                 }
@@ -287,17 +301,7 @@ async fn publish(
             }
         });
     }
-    let mut tls = rustls::ClientConfig::builder()
-        .with_root_certificates(roots(credentials)?)
-        .with_client_auth_cert(
-            certs(&credentials.join("cert.pem"))?,
-            key(&credentials.join("key.pem"))?,
-        )?;
-    tls.alpn_protocols = vec![ALPN.to_vec()];
-    let mut config = quinn::ClientConfig::new(Arc::new(
-        quinn::crypto::rustls::QuicClientConfig::try_from(tls)?,
-    ));
-    config.transport_config(transport());
+    let config = tls::client(credentials, insecure_lan, ALPN)?;
     let bind = if remote.is_ipv4() {
         "0.0.0.0:0"
     } else {
@@ -317,6 +321,7 @@ async fn publish(
         endpoint.connect_with(config, remote, server_name)?,
     )
     .await??;
+    tls::address(raw.remote_address(), insecure_lan)?;
     let conn = kynet::Connection::from(raw);
     let (mut send, mut recv) = conn.open_bi().await?;
     // QUIC streams become visible to the receiver after their first byte.
@@ -386,25 +391,51 @@ async fn main() -> Result<()> {
         Command::CameraServe {
             listen,
             credentials,
-        } => media::serve(listen, &credentials).await,
+            insecure_lan,
+            status_file,
+        } => media::serve(listen, &credentials, status_file.as_deref(), insecure_lan).await,
         Command::CameraView {
             remote,
             credentials,
+            insecure_lan,
             server_name,
-        } => media::view(remote, &credentials, &server_name).await,
+            status_file,
+        } => {
+            media::view(
+                remote,
+                &credentials,
+                &server_name,
+                status_file.as_deref(),
+                insecure_lan,
+            )
+            .await
+        }
         Command::Receive {
             listen,
             credentials,
+            insecure_lan,
             output,
-        } => receive(listen, &credentials, &output).await,
+        } => receive(listen, &credentials, &output, insecure_lan).await,
         Command::Publish {
             remote,
             credentials,
+            insecure_lan,
             server_name,
             simulate,
             seconds,
             hz,
-        } => publish(remote, &credentials, &server_name, simulate, seconds, hz).await,
+        } => {
+            publish(
+                remote,
+                &credentials,
+                &server_name,
+                simulate,
+                seconds,
+                hz,
+                insecure_lan,
+            )
+            .await
+        }
     }
 }
 

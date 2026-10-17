@@ -1,203 +1,119 @@
-# MacBook leader → Ubuntu laptop follower over Wi-Fi LAN
+# MacBook leader → Ubuntu follower over LAN
 
-| Computer | Connected devices | Role |
+The public repository is https://github.com/prathamv0811/so101-kyber-position.
+The follower laptop's observed Wi-Fi address is **192.168.101.50**. Both computers
+must be on the same reachable Wi-Fi network. A guest network may isolate clients.
+
+| Device | Computer | Network port (UDP) |
 | --- | --- | --- |
-| MacBook | SO-101 leader over USB | Read and publish joint positions |
-| Ubuntu laptop | SO-101 follower, optional USB camera | Receive, record and optionally follow |
+| SO-101 follower | Ubuntu laptop | 7445 |
+| Logitech Brio 100 top camera | Ubuntu laptop | 7446 |
+| Sonix USB wrist camera | Ubuntu laptop | 7447 |
+| SO-101 leader | MacBook | Publishes to laptop |
 
-The Ubuntu Wi-Fi address observed on October 17, 2026 is **192.168.101.50** on
-`wlp0s20f3`. Recheck with `ip -brief -4 address` if the laptop reconnects or the
-router changes its DHCP lease. Set `FOLLOWER_HOST` to that address on the Mac.
-Both computers must be on the same reachable LAN; a guest network may isolate
-clients. Control uses UDP **7445** and optional camera preview uses UDP **7446**.
-No cloud server, SSH tunnel, Tailscale or router port forwarding is required.
+## Install on the Mac
 
-## 1. Install on the MacBook
-
-Install Xcode Command Line Tools if they are missing:
+The pinned LeRobot/PyTorch environment targets Apple Silicon. Install Xcode Command
+Line Tools if needed (`xcode-select --install`), then with Homebrew installed:
 
 ```bash
-xcode-select --install
-```
-
-With Homebrew installed, use [Rust](https://formulae.brew.sh/formula/rust) and
-[uv](https://docs.astral.sh/uv/getting-started/installation/#homebrew):
-
-```bash
-brew install rust uv pkg-config
+brew install rust uv pkg-config gstreamer
 git clone https://github.com/prathamv0811/so101-kyber-position.git
 cd so101-kyber-position
 python3 scripts/setup.py
-./target/debug/so101-kyber-position --help
 ```
 
-The repository is private; authenticate to GitHub on the Mac first. `gh repo clone
-prathamv0811/so101-kyber-position` is another option if GitHub CLI is configured.
-Setup targets Apple Silicon Macs with the pinned LeRobot/PyTorch stack, builds the SDK natively,
-and creates a Python 3.12 serial environment. It does not run Ubuntu apt commands
-on macOS. The physical MacBook has not been accessed or tested from this session;
-the repository includes a macOS CI build check.
+If already cloned, run `git pull` followed by `python3 scripts/setup.py` to rebuild.
+The Rust executable must be built on each computer. The physical MacBook has not
+been tested from this session; Ubuntu and macOS builds are covered by CI.
 
-The leader publisher does not need GStreamer. The optional camera viewer can send
-H.264 to a decoder or save an H.264 file; configure the Mac's video tools later
-if using preview.
+## Prepare the Mac leader
 
-## 2. Pair once on the Ubuntu laptop
-
-The project and dependencies are already installed at:
-
-```bash
-cd /home/dev/so101-kyber-position
-source scripts/build-env.sh
-bash scripts/pair.sh credentials
-mkdir -p recordings
-```
-
-If credentials already exist, reuse them; the script refuses to overwrite them.
-Transfer **only `credentials/leader/`** to the MacBook, placing it under the same
-relative directory in the Mac's checkout. Use a trusted local transfer such as
-AirDrop or SCP if SSH is already configured. Keep `credentials/server/` and the CA
-signing key on the Ubuntu laptop. Credentials and local calibration/configuration
-files are ignored by Git and must not be added to the repository.
-
-## 3. Test the LAN before opening motors
-
-On Ubuntu, start the record-only receiver:
-
-```bash
-cd /home/dev/so101-kyber-position
-source scripts/build-env.sh
-mkdir -p recordings
-./target/debug/so101-kyber-position receive \
-  --listen 192.168.101.50:7445 \
-  --credentials credentials/server \
-  --output "recordings/lan-$(date +%Y%m%d-%H%M%S).jsonl"
-```
-
-On the MacBook:
-
-```bash
-cd so101-kyber-position
-export FOLLOWER_HOST=192.168.101.50
-./target/debug/so101-kyber-position publish \
-  --remote "$FOLLOWER_HOST:7445" \
-  --credentials credentials/leader \
-  --simulate --seconds 10
-```
-
-The laptop should print and record about 300 position samples, then end the
-session. This test does not open either arm. If it times out, check the laptop's
-current address, Wi-Fi client isolation and an active firewall's UDP 7445 rule
-for the Mac's LAN address. Do not disable the entire firewall. No firewall rule
-has been changed by the setup scripts.
-
-## 4. Read the real leader on the Mac
-
-Identify the USB device using:
+Identify its USB path:
 
 ```bash
 ls /dev/cu.usbmodem* /dev/cu.usbserial* 2>/dev/null
 ```
 
-Calibrate the supported leader using the official LeRobot workflow:
+Reuse an existing matching LeRobot leader calibration at `calibration/leader.json`,
+or calibrate the supported arm with LeRobot:
 
 ```bash
-.venv/bin/python calibrate.py leader --port /dev/cu.usbmodemREAL_DEVICE \
+.venv/bin/python calibrate.py leader --port /dev/cu.usbmodemYOUR_DEVICE \
   --id leader --directory calibration --attended
 ```
 
-Follow its midpoint and range-of-motion prompts. This saves
-`calibration/leader.json`. An existing matching LeRobot calibration may be reused.
-It must
-match the actual motor IDs, ranges and homing offsets. LeRobot loads the saved file; the adapter verifies ranges/offsets against hardware
-and refuses an arm with torque on. Publishing does not recalibrate the arm.
-Start a fresh record-only receiver on Ubuntu, then on the Mac run:
+Follow LeRobot's midpoint and range prompts. The passive leader reader verifies
+that saved calibration matches the connected arm and refuses enabled torque.
+Each computer keeps its own calibration; no calibration transfer is needed.
+
+## Start the follower laptop
+
+The local profile is `config/follower.launch.local.json`. This laptop uses the
+existing `follower_2` calibration, verified against all six connected motors.
+Its private `follower.local.json` limits must be reviewed before operation;
+example configuration is provided in `config/follower.launch.example.json`.
+
+With the follower supported and an attendant at its power cutoff:
 
 ```bash
-set -o pipefail
-export FOLLOWER_HOST=192.168.101.50
-export LEADER_PORT=/dev/cu.usbmodemREPLACE_WITH_REAL_DEVICE
-.venv/bin/python hardware.py leader \
-  --port "$LEADER_PORT" --calibration calibration/leader.json --hz 30 |
-./target/debug/so101-kyber-position publish \
-  --remote "$FOLLOWER_HOST:7445" --credentials credentials/leader
-```
-
-Move the supported passive leader and verify that the six recorded positions
-change as expected. This still does not enable follower torque.
-
-## 5. Commission the follower on Ubuntu
-
-Identify the follower's stable USB path with `ls -l /dev/serial/by-id/`, then
-calibrate it using LeRobot on Ubuntu:
-
-```bash
-.venv/bin/python calibrate.py follower --port /dev/serial/by-id/REAL_FOLLOWER \
-  --id follower --directory calibration --attended
-```
-
-This saves its own `calibration/follower.json`. Copy `calibration/leader.json`
-from the Mac into the laptop's `calibration/` directory as well, so relative
-movement can be mapped correctly.
-Copy `config/follower.example.json` to `follower.local.json`, replace all
-placeholder bounds/speeds/inversion flags with reviewed physical limits and
-then set `limits_reviewed` to `true`.
-
-With an attendant supporting the follower and able to operate its power cutoff,
-start the Ubuntu receiver and follower adapter:
-
-```bash
-set -o pipefail
+cd /home/dev/so101-kyber-position
 source scripts/build-env.sh
-export FOLLOWER_PORT=/dev/serial/by-id/REPLACE_WITH_FOLLOWER
-./target/debug/so101-kyber-position receive \
-  --listen 192.168.101.50:7445 --credentials credentials/server \
-  --output "recordings/physical-$(date +%Y%m%d-%H%M%S).jsonl" |
-.venv/bin/python hardware.py drive \
-  --port "$FOLLOWER_PORT" --config follower.local.json \
-  --leader-calibration calibration/leader.json \
-  --follower-calibration calibration/follower.json \
-  --attended --enable-motion
+.venv/bin/python session.py follower --insecure-lan --attended --enable-motion
 ```
 
-Run the real leader publisher from step 4. First check no-jump enable, directions,
-bounded movement, Ctrl+C stop and connection-loss stop in short attended sessions.
-Support the follower during torque-off. The session never resumes automatically.
-Physical behavior on these arms has not yet been verified. See the main README
-for watchdog behavior, recording semantics and the optional GStreamer camera path.
+This starts both camera streams and the command receiver. The follower waits
+with torque off for up to one hour. Fresh leader input and both camera streams
+are required before torque is enabled. The first input anchors movement to the
+follower's current pose; subsequent commands are relative and bounded by limits.
 
-## 6. Stream the laptop camera through the Kyber SDK
+For video only, use `--preview-only` instead of the two motor flags. Start a
+matching `--preview-only` operator. For a fully synthetic test on both sides,
+use `--simulate`; never connect a simulated publisher to a physical follower.
 
-Install the Mac's decoder with [Homebrew GStreamer](https://formulae.brew.sh/formula/gstreamer):
+## Connect from the Mac
+
+In the Mac checkout, replace the USB placeholder:
 
 ```bash
-brew install gstreamer
+.venv/bin/python session.py operator \
+  --host 192.168.101.50 --insecure-lan \
+  --port /dev/cu.usbmodemYOUR_DEVICE \
+  --calibration calibration/leader.json
 ```
 
-On Ubuntu, identify the camera with `ls -l /dev/v4l/by-id/`, then in a separate
-terminal from the command receiver start GStreamer capture/H.264 encoding and
-the official KyProto GOP video channel:
+Two windows show the top and wrist cameras. Only after both receive video does
+the Mac begin publishing leader positions. Ctrl+C ends the session. Command
+loss, stale camera progress, or a child-process failure ends following and
+attempts verified torque-off. Support the follower during torque-off. An
+unconfirmed stop requires local power isolation. Restart the follower launcher
+for each new session; there is no automatic reconnect or motion resume.
+
+Logs and received positions are saved privately under `recordings/` on each
+computer. Motor activity and stop confirmation appear in the follower run's
+`motors.log`. The journal contains received leader positions, not measured
+follower telemetry. Physical motion and stop performance still require local
+commissioning; automated tests use fake motor hardware.
+
+## Credentials are optional on a trusted LAN
+
+`--insecure-lan` on **both** computers requires no credential files or copying.
+QUIC remains encrypted, using an automatically generated server certificate,
+but neither computer verifies peer identity. Other devices on the LAN could
+connect or impersonate a peer. This mode accepts only explicit private,
+loopback, or link-local addresses, and refuses public/wildcard bind addresses.
+Private-address checks are not a substitute for a trusted network.
+
+For paired mutual TLS, omit `--insecure-lan`. Generate credentials on the laptop:
 
 ```bash
-set -o pipefail
-source scripts/build-env.sh
-/usr/bin/python3 camera.py --device /dev/v4l/by-id/REPLACE_WITH_CAMERA |
-./target/debug/so101-kyber-position camera-serve \
-  --listen 192.168.101.50:7446 --credentials credentials/server
+bash scripts/pair.sh credentials
 ```
 
-On the MacBook:
+Transfer only `credentials/leader/` to the Mac checkout; retain the CA signing key
+and server keys on the laptop. Both modes use the same ports and watchdogs.
+Credentials, calibration, recordings, and local profiles stay out of Git.
 
-```bash
-set -o pipefail
-export FOLLOWER_HOST=192.168.101.50
-./target/debug/so101-kyber-position camera-view \
-  --remote "$FOLLOWER_HOST:7446" --credentials credentials/leader |
-gst-launch-1.0 -q fdsrc ! h264parse ! avdec_h264 ! videoconvert ! autovideosink sync=false
-```
-
-The camera stream and command stream use the same LAN, with separate authenticated
-Kyber connections on UDP 7446 and 7445 respectively. LeRobot handles calibration
-and the USB motor buses; Kyber handles video and network commands. A video failure
-currently ends preview independently of the position controller. The physical
-Mac display and USB camera have not been commissioned by automated tests.
+If connection fails, check the laptop's current address (`ip -brief -4 address`),
+Wi-Fi client isolation, firewall UDP rules for 7445–7447, and the latest run logs.
+The software does not change firewall settings or require router port forwarding.

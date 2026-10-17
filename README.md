@@ -3,7 +3,7 @@
 A fresh project, independent of Tether. A passive SO-101 leader publishes all
 six measured motor positions through **kynput 0.29.0 input types** and the current
 **KyNet QUIC transport**. A server records those positions and can feed an
-explicitly enabled SO-101 follower. GStreamer supplies an optional camera feed.
+explicitly enabled SO-101 follower. GStreamer supplies top and wrist camera feeds. A combined launcher couples video health to following.
 
 **Current deployment: leader on a MacBook, follower on this Ubuntu laptop,
 connected over the same Wi-Fi LAN.** Start with the
@@ -11,7 +11,7 @@ connected over the same Wi-Fi LAN.** Start with the
 address is `192.168.101.50`; confirm it before connecting.
 
 ```
-Leader USB → LeRobot reader → kynput six-axis packets → mTLS/KyNet QUIC
+Leader USB → LeRobot reader → kynput six-axis packets → TLS/KyNet QUIC
                                                         ↓
                                          server JSONL recorder
                                                         ↓ optional
@@ -19,12 +19,13 @@ Leader USB → LeRobot reader → kynput six-axis packets → mTLS/KyNet QUIC
                                                         ↓
                                                    Follower USB
 
-Camera → GStreamer H.264 → KyProto GOP video channel → decoder on MacBook
+Top + wrist cameras → GStreamer H.264 → KyProto GOP channels → MacBook windows
 ```
 
 Joint order is `shoulder_pan`, `shoulder_lift`, `elbow_flex`, `wrist_flex`,
-`wrist_roll`, `gripper`. Values are **integer servo ticks (0–4095)**, not radians,
-degrees, or Cartesian wrist poses. LeRobot acquires the six motors with a synchronized bus read;
+`wrist_roll`, `gripper`. Wire values are **calibrated fractions (0–4095)**: the leader maps its own
+LeRobot range into 12 bits; the follower maps relative changes into its own range.
+They are not raw servo ticks, radians, degrees, or Cartesian wrist poses. LeRobot acquires the six motors with a synchronized bus read;
 the timestamp precedes acquisition and all six readings travel in one frame.
 
 ## SDK and installation
@@ -73,6 +74,30 @@ the native `kyavservice` GStreamer configuration. The project directly embeds th
 SDK's KyProto video channel; it does not build the full Kyber desktop/VLC app or
 its `kyavservice` executable. This is an SDK application, not a stock desktop client.
 
+
+## Dual video and motor control over LAN
+
+On the prepared follower laptop, with the supported arm attended:
+
+```bash
+source scripts/build-env.sh
+.venv/bin/python session.py follower --insecure-lan --attended --enable-motion
+```
+
+On the calibrated MacBook leader:
+
+```bash
+.venv/bin/python session.py operator --host 192.168.101.50 --insecure-lan \
+  --port /dev/cu.usbmodemYOUR_DEVICE --calibration calibration/leader.json
+```
+
+No credentials need copying in LAN mode. Top video uses UDP 7446, wrist video
+7447, and positions 7445. Both video windows start before leader publishing;
+the follower waits torque-off until fresh input and both streams are available.
+Camera loss and command loss stop following. Omit `--insecure-lan` on both
+computers to use paired mutual TLS instead. See the [LAN guide](docs/macbook-lan.md)
+for installation, calibration, local profile setup, and session restart behavior.
+
 ## Test without hardware
 
 ```bash
@@ -80,6 +105,8 @@ source scripts/build-env.sh
 cargo test --locked
 .venv/bin/python -m unittest discover -s tests -v
 .venv/bin/python scripts/smoke.py
+.venv/bin/python scripts/test-session.py
+.venv/bin/python scripts/test-session.py --insecure-lan
 ```
 
 The smoke test uses real processes, fresh temporary certificates and actual QUIC
@@ -138,8 +165,7 @@ On Ubuntu with the follower:
 ```
 
 This saves `calibration/leader.json` and `calibration/follower.json` respectively.
-Use `--calibration calibration/leader.json` for the reader. Copy the leader's
-calibration to the follower computer and use both files for the drive adapter.
+Use `--calibration calibration/leader.json` for the reader. Keep each arm's calibration on its own computer; protocol v2 needs no calibration transfer.
 The direct equivalent is `.venv/bin/lerobot-calibrate --teleop.type=so101_leader
 --teleop.port=... --teleop.id=leader --teleop.calibration_dir=calibration` (use
 `robot`, `so101_follower` and `follower` for the other arm).
@@ -149,9 +175,9 @@ Calibration is interactive physical work; it has not been run on these arms.
 ## Publish a physical leader
 
 Identify the leader's **stable serial path**, its calibration and its actual motor
-IDs before opening it. On this laptop the currently connected adapters end in
-`5B14030562` and `5B14115694`; their roles have not been identified. No calibration
-or physical configuration has been copied from previous projects.
+IDs before opening it. The Ubuntu follower is adapter `5B14030562`. Its existing LeRobot
+`follower_2` calibration has been verified against all six motor registers and
+copied privately to `calibration/follower.json`. The Mac needs its own leader calibration.
 
 Use the LeRobot calibration produced above at `calibration/leader.json`.
 It must contain each joint's `id`, `drive_mode`, `homing_offset`, `range_min`, and
@@ -202,7 +228,7 @@ source scripts/build-env.sh
   --output recordings/physical-session.jsonl |
 .venv/bin/python hardware.py drive \
   --port FOLLOWER_SERIAL_PATH --config follower.local.json \
-  --leader-calibration calibration/leader.json --follower-calibration calibration/follower.json \
+  --follower-calibration calibration/follower.json \
   --attended --enable-motion
 ```
 
@@ -250,15 +276,17 @@ gst-launch-1.0 -q fdsrc ! h264parse ! avdec_h264 ! videoconvert ! autovideosink 
 
 Permit UDP 7446 on the same private interface. The KyProto GOP video channel uses a separate authenticated connection. Raw
 capture queues drop old buffers before encoding; stale encoded input is rejected
-until a keyframe and transport stalls terminate the preview. Camera failure does not automatically stop the
-separate position controller; unattended visual teleoperation is not implemented.
+until a keyframe and transport stalls terminate the preview. Use `session.py`
+for coupled operation: it requires both camera streams before publishing or
+enabling torque and stops following on stale video. Standalone commands above
+require explicit `hardware.py drive --video-status` files to couple video health.
 
 ## Input protocol
 
 Upstream kynput has no native SO-101 motor-position type. This project uses its
 six `GamepadEvent::Axis` types as a **project-specific virtual position device**,
-with device ID 101. All values are nonnegative raw ticks, preserving the full
-12-bit position exactly, including both trigger axes. The custom receiver
+with device ID 101. All values are nonnegative calibrated fractions in 0–4095, including both
+trigger axes. The leader converts local raw positions using its own calibration. The custom receiver
 consumes them directly; no OS virtual gamepad or standard game controller
 normalization is involved. Stock Kyber desktop input injection will not drive
 an SO-101 with these packets.
@@ -268,8 +296,10 @@ big-endian `u64` fields), followed by six entries, each containing the kynput
 input-type byte and its eight-byte axis payload. All joints must be present in
 the defined order. The receiver checks framing, discriminants, device ID, ticks,
 sequence and challenge before calling upstream deserialization. TLS 1.3 mutual
-authentication protects both ends. ALPN distinguishes positions from camera
-frames. This is a custom application on the Kyber SDK rather than a stock
+authentication protects both ends by default. Optional `--insecure-lan` requires
+no credential files, uses an ephemeral certificate, and skips peer identity
+verification on explicit private LAN addresses; use only on a trusted network. ALPN distinguishes positions from camera
+frames. Position ALPN v2 rejects older raw-tick clients. This is a custom application on the Kyber SDK rather than a stock
 `kynputserver` deployment.
 
 A frame echoing the current challenge with all remaining bytes zero explicitly

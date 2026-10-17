@@ -39,3 +39,5 @@ jobs:
         run: |
           source scripts/build-env.sh
           .venv/bin/python scripts/smoke.py
+          .venv/bin/python scripts/test-session.py
+          .venv/bin/python scripts/test-session.py --insecure-lan

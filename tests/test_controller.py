@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from hardware import Bus, JOINTS, PositionController, drive
+from hardware import Bus, JOINTS, PositionController, drive, require_video, normalized_positions
 
 
 class ControllerTests(unittest.TestCase):
@@ -20,7 +20,12 @@ class ControllerTests(unittest.TestCase):
             for name in JOINTS}}
 
     def sample(self, seq, positions):
-        return {"version": 1, "seq": seq, "received_unix_ns": time.time_ns(), "positions": positions}
+        return {"version": 2, "seq": seq, "received_unix_ns": time.time_ns(), "positions": positions}
+
+    def test_leader_normalizes_from_its_own_calibration(self):
+        cal = [{"range_min": 1000, "range_max": 3000} for _ in JOINTS]
+        self.assertEqual(normalized_positions([1000, 3000, 2000, 1000, 3000, 2000], cal),
+                         [0, 4095, 2048, 0, 4095, 2048])
 
     def test_relative_anchor_bounds_and_inversion(self):
         self.config["joints"][JOINTS[1]]["invert"] = True
@@ -63,7 +68,20 @@ class ControllerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             PositionController(self.config, self.cal, self.cal, [2000] * 6)
 
+    def test_stale_video_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            status = Path(directory) / "wrist.json"
+            status.write_text(json.dumps({"frames": 10, "updated_unix_ns": time.time_ns() - 600_000_000}))
+            with self.assertRaisesRegex(RuntimeError, "Camera stream stale"):
+                require_video([status])
+
     def test_input_loss_after_enable_disables_all_motors(self):
+        self.exercise_drive_fault()
+
+    def test_video_loss_after_enable_disables_all_motors(self):
+        self.exercise_drive_fault(camera_failure=True)
+
+    def exercise_drive_fault(self, camera_failure=False):
         bus = object.__new__(Bus)
         bus.ids = list(range(1, 7))
         torque = {motor: 0 for motor in bus.ids}
@@ -85,10 +103,12 @@ class ControllerTests(unittest.TestCase):
             config = Path(directory) / "limits.json"
             config.write_text(json.dumps(self.config))
             args = Namespace(config=config, port="fake", leader_calibration="fake",
-                follower_calibration="fake", enable_motion=True, attended=True)
+                follower_calibration="fake", enable_motion=True, attended=True, video_status=["fake-video"])
+            reads = [first, self.sample(2, [2010] * 6)] if camera_failure else [first, TimeoutError("Disconnected")]
+            video = [None, RuntimeError("Camera stream stale")] if camera_failure else None
             with patch("hardware.Bus", return_value=bus), patch("hardware.calibration", return_value=cal), \
-                 patch("hardware.read_sample", side_effect=[first, TimeoutError("Disconnected")]):
-                with self.assertRaises(TimeoutError):
+                 patch("hardware.read_sample", side_effect=reads), patch("hardware.require_video", side_effect=video):
+                with self.assertRaises(RuntimeError if camera_failure else TimeoutError):
                     drive(args)
         self.assertTrue(all(value == 0 for value in torque.values()))
         self.assertEqual([motor for motor, reg, value in writes if reg == 40 and value == 0], list(range(1, 7)))
