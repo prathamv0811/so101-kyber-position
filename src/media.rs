@@ -81,29 +81,62 @@ pub async fn serve(
         "KyProto H.264 camera listening on {}",
         endpoint.local_addr()?
     );
-    let raw = tokio::time::timeout(
-        Duration::from_secs(5),
-        endpoint.accept().await.context("Listener closed")?,
-    )
-    .await??;
-    tls::address(raw.remote_address(), insecure_lan)?;
-    let conn = kynet::Connection::from(raw);
-    // Establish a completion channel before KyProto takes ownership of routing.
-    let (mut done_tx, mut done_rx) =
-        tokio::time::timeout(Duration::from_secs(3), conn.accept_bi()).await??;
-    let mut marker = [0];
-    tokio::time::timeout(Duration::from_secs(1), done_rx.read_exact(&mut marker)).await??;
-    ensure!(marker == *b"M", "Invalid media completion marker");
-    let media = tokio::time::timeout(
-        Duration::from_secs(3),
-        kyproto::Connection::accept(conn.clone()),
-    )
-    .await??;
-    let (id, channel) = media
-        .register_video_endpoint(VideoProtocol::GopStream)
-        .await?;
-    ensure!(id == 0, "Unexpected video endpoint ID");
-    let mut video = tokio::time::timeout(Duration::from_secs(3), channel.ready()).await??;
+    // Retry failed camera setup only before video has started. No live stream
+    // or motor session is automatically reconnected after a failure.
+    let (conn, mut done_tx, mut done_rx, _media, mut video) = loop {
+        let incoming = endpoint.accept().await.context("Camera listener closed")?;
+        let raw = match tokio::time::timeout(Duration::from_secs(5), incoming).await {
+            Ok(Ok(connection)) => connection,
+            outcome => {
+                eprintln!("Camera TLS setup failed: {outcome:?}; waiting for another client");
+                continue;
+            }
+        };
+        tls::address(raw.remote_address(), insecure_lan)?;
+        eprintln!("Camera QUIC connected: {}", raw.remote_address());
+        let conn = kynet::Connection::from(raw);
+        let setup: Result<_> = async {
+            let (done_tx, mut done_rx) =
+                tokio::time::timeout(Duration::from_secs(5), conn.accept_bi())
+                    .await
+                    .context("Camera client did not open completion stream within 5 seconds")??;
+            let mut marker = [0];
+            tokio::time::timeout(Duration::from_secs(3), done_rx.read_exact(&mut marker))
+                .await
+                .context("Camera client did not send completion marker within 3 seconds")??;
+            ensure!(marker == *b"M", "Invalid media completion marker");
+            eprintln!("Camera completion stream ready; negotiating KyProto");
+            let media = tokio::time::timeout(
+                Duration::from_secs(5),
+                kyproto::Connection::accept(conn.clone()),
+            )
+            .await
+            .context("Camera KyProto control negotiation exceeded 5 seconds")??;
+            let (id, channel) = tokio::time::timeout(
+                Duration::from_secs(5),
+                media.register_video_endpoint(VideoProtocol::GopStream),
+            )
+            .await
+            .context("Camera endpoint registration exceeded 5 seconds")??;
+            ensure!(id == 0, "Unexpected video endpoint ID");
+            eprintln!("Camera endpoint 0 registered; waiting for subscription");
+            let video = tokio::time::timeout(Duration::from_secs(5), channel.ready())
+                .await
+                .context("Camera client did not subscribe to endpoint 0 within 5 seconds")??;
+            Ok((done_tx, done_rx, media, video))
+        }
+        .await;
+        match setup {
+            Ok((done_tx, done_rx, media, video)) => {
+                eprintln!("Camera client subscribed; starting H.264 video");
+                break (conn, done_tx, done_rx, media, video);
+            }
+            Err(error) => {
+                conn.close(1, "Camera startup failed; retry client explicitly");
+                eprintln!("Camera startup failed: {error:#}; waiting for another client");
+            }
+        }
+    };
     video
         .send(AVPacket::Codec(CodecPacket {
             header: CodecPacketHeader {
@@ -118,8 +151,9 @@ pub async fn serve(
     let mut frames = 0;
     loop {
         let mut header = [0; 13];
-        let first =
-            tokio::time::timeout(Duration::from_secs(1), source.read(&mut header[..1])).await??;
+        let first = tokio::time::timeout(Duration::from_secs(1), source.read(&mut header[..1]))
+            .await
+            .context("GStreamer H.264 source produced no data for 1 second")??;
         if first == 0 {
             break;
         }
@@ -152,7 +186,8 @@ pub async fn serve(
             Duration::from_millis(500),
             video.send(packet(data, is_key, false, pts)),
         )
-        .await??;
+        .await
+        .context("Camera video send stalled for 500 ms")??;
         have_key = true;
         last_pts = pts;
         frames += 1;
@@ -203,8 +238,9 @@ pub async fn view(
     .await
     .context("KyProto camera negotiation timed out")??;
     let channel = media.connect_video_endpoint(0, VideoProtocol::GopStream)?;
-    let mut video = tokio::time::timeout(Duration::from_secs(3), channel.ready())
-        .await??
+    let mut video = tokio::time::timeout(Duration::from_secs(5), channel.ready())
+        .await
+        .context("Camera endpoint 0 subscription exceeded 5 seconds")??
         .make_cancel_safe();
     let mut completion = tokio::spawn(async move {
         let mut pts = [0; 8];

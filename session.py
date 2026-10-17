@@ -38,7 +38,9 @@ class Children:
     def check(self):
         for name, process in self.processes:
             if process.poll() is not None:
-                raise RuntimeError(f"{name} ended (exit {process.returncode}); see {self.directory / (name + '.log')}")
+                path = self.directory / (name + ".log")
+                detail = "\n".join(path.read_text(errors="replace").splitlines()[-12:])
+                raise RuntimeError(f"{name} ended (exit {process.returncode})\n{detail}\nLog: {path}")
 
     def close(self):
         # The motor adapter gets SIGTERM first so it can verify torque-off before
@@ -172,6 +174,7 @@ def operator(args, children, runtime):
     if args.simulate:
         command += ["--simulate"]
     else:
+        print(f"Starting LeRobot leader at {args.hz} Hz on {args.port}; log: {runtime / 'leader.log'}", flush=True)
         source = children.start("leader", [sys.executable, ROOT / "hardware.py", "leader",
             "--port", args.port, "--calibration", local(args.calibration), "--hz", args.hz], pipe=True)
     publisher = children.start("publisher", command, stdin=source.stdout if source else None)

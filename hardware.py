@@ -179,6 +179,7 @@ def leader(args):
     try:
         bus.require_passive()
         verify_calibration(bus, cal)
+        print(f"LeRobot SO-101 leader ready at {args.hz} Hz on {args.port}", file=sys.stderr)
         period = 1 / args.hz
         deadline = time.monotonic()
         while True:

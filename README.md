@@ -137,6 +137,7 @@ source scripts/build-env.sh
 cargo test --locked
 .venv/bin/python -m unittest discover -s tests -v
 .venv/bin/python scripts/smoke.py
+.venv/bin/python scripts/test-camera-startup.py
 .venv/bin/python scripts/test-session.py
 .venv/bin/python scripts/test-session.py --insecure-lan
 ```
@@ -165,3 +166,8 @@ These software checks do not establish hardware stop performance.
 
 See [LICENSE](LICENSE) for AGPL-3.0-or-later; upstream components retain their own
 license notices.
+
+Camera setup errors now name the failed stage. Failed initial camera setup
+leaves its listener waiting for a new explicit client attempt; established video
+or motor sessions still stop on failure. The Mac launcher prints the failing
+child process’s log tail in Terminal.
