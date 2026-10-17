@@ -52,9 +52,15 @@ with tempfile.TemporaryDirectory(prefix="so101-dual-video-") as directory:
         runs = set((ROOT / "recordings").glob("*")) - before
         videos = []
         samples = 0
+        metrics = []
         for run in runs:
             if not run.is_dir():
                 continue
+            for name in ("commands", "publisher"):
+                path = run / f"{name}.log"
+                if path.exists():
+                    metrics.extend(json.loads(line.removeprefix("CONTROL_METRICS "))
+                                   for line in path.read_text().splitlines() if line.startswith("CONTROL_METRICS "))
             for name in ("top", "wrist"):
                 status = run / f"{name}.json"
                 assert status.exists(), f"Missing {status}"
@@ -71,8 +77,15 @@ with tempfile.TemporaryDirectory(prefix="so101-dual-video-") as directory:
                 assert RATE * .9 <= measured_hz <= RATE * 1.1, measured_hz
         assert samples >= 30, samples
         assert len(videos) == 4, videos
+        receiver_metrics = [m for m in metrics if m["role"] == "receiver"]
+        publisher_metrics = [m for m in metrics if m["role"] == "publisher"]
+        assert sum(m["samples"] for m in receiver_metrics) == samples
+        assert receiver_metrics and publisher_metrics, metrics
+        assert all(m["measurements"]["delivery_queue_ms"]["max"] >= 0 for m in receiver_metrics)
+        assert all(m["measurements"]["source_age_ms"]["max"] <= 100 for m in publisher_metrics)
         print(json.dumps({"passed": True, "top_and_wrist_decoded": True,
             "server_and_client_video_frames": videos, "command_samples": samples, "measured_command_hz": round(measured_hz, 1),
+            "timing_diagnostics_validated": True,
             "hardware_opened": False, "credential_files_required": not INSECURE}, indent=2))
     except Exception:
         print((temporary / "follower.log").read_text())

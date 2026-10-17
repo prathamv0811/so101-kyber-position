@@ -10,7 +10,7 @@ import time
 import uuid
 from pathlib import Path
 
-from hardware import JOINTS, LeRobotControls, calibration, require_video, ticks_to_action
+from hardware import JOINTS, MAX_CONTROL_HZ, LeRobotControls, calibration, require_video, ticks_to_action
 
 ROOT = Path(__file__).resolve().parent
 BIN = ROOT / "target/debug/so101-kyber-position"
@@ -138,6 +138,7 @@ def follower(args, children, runtime):
         children.start("motors", command, stdin=receiver.stdout)
         receiver.stdout.close()
     print(f"Command receiver: {address}; {args.hz} Hz; log directory: {runtime}", flush=True)
+    print(f"Timing diagnostics: {runtime / 'commands.log'} and {runtime / 'motors.log'}", flush=True)
     return receiver
 
 
@@ -179,6 +180,7 @@ def operator(args, children, runtime):
         source = children.start("leader", [sys.executable, ROOT / "hardware.py", "leader",
             "--port", args.port, "--calibration", local(args.calibration), "--hz", args.hz], pipe=True)
     publisher = children.start("publisher", command, stdin=source.stdout if source else None)
+    print(f"Publisher timing diagnostics: {runtime / 'publisher.log'}", flush=True)
     if source:
         source.stdout.close()
     return publisher, statuses
@@ -203,7 +205,7 @@ def main():
     client.add_argument("--headless", action="store_true", help="Decode without windows for tests")
     client.add_argument("--seconds", type=float)
     for role in (server, client):
-        role.add_argument("--hz", type=int, choices=range(10, 121), default=120, metavar="10..120",
+        role.add_argument("--hz", type=int, choices=range(10, MAX_CONTROL_HZ + 1), default=120, metavar="10..500",
                           help="Command/leader rate (default: 120); video stays at 30 fps")
         role.add_argument("--insecure-lan", "--tailscale", dest="insecure_lan", action="store_true",
                           help="Private LAN/Tailscale; no application credentials or peer identity verification")
