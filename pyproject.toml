@@ -1,0 +1,5 @@
+[project]
+name = "so101-kyber-hardware"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = ["feetech-servo-sdk==1.0.0", "pyserial==3.5"]

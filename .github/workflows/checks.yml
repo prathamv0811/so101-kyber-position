@@ -1,0 +1,29 @@
+name: Build and test
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Install build prerequisites (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libx11-dev libevdev-dev libinput-dev libudev-dev libxcb-xtest0-dev libxcb-xfixes0-dev libxcb-shape0-dev libxcb-render0-dev
+      - name: Build pinned SDK and install serial runtime
+        run: python3 scripts/setup.py
+      - name: Packet and controller tests
+        shell: bash
+        run: |
+          source scripts/build-env.sh
+          cargo test --locked
+          .venv/bin/python -m unittest discover -s tests -v
+      - name: Pairing portability
+        run: bash scripts/pair.sh "$RUNNER_TEMP/test-position-credentials"

@@ -1,0 +1,11 @@
+{
+  "checked_utc": "2026-10-17",
+  "release": "0.29.0",
+  "sdk": {"url": "https://gitlab.com/kyber/core/kysdk.git", "rev": "ebca32a08f6488ea23750943ded52119efd584d6"},
+  "components": {
+    "kymux": "af10dbb3ea016135c0ec8e01143179ad4bda005b",
+    "kynput": "729244364151dfbb4e17beec3c361fe83349afb5",
+    "kyutil": "1ae6ee42ac1be9a91f0d25089da37e7f1ac3e42a",
+    "kymedia": "b0efdfa251a19274ff1d9bf6324deb6bee10c026"
+  }
+}

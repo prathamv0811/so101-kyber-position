@@ -1,0 +1,21 @@
+[package]
+name = "so101-kyber-position"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+anyhow = "1"
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+kynput = { path = "vendor/kysdk/kynput/kynput", default-features = false }
+kynet = { path = "vendor/kysdk/kymux/kynet", features = ["kynet-quinn"] }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+rustls-pemfile = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+
+[patch.crates-io]
+kycom = { path = "vendor/kysdk/kymux/kycom" }

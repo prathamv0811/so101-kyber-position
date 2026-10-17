@@ -1,0 +1,11 @@
+{
+  "limits_reviewed": false,
+  "joints": {
+    "shoulder_pan": {"min_ticks": 1000, "max_ticks": 3000, "max_ticks_per_second": 150, "invert": false},
+    "shoulder_lift": {"min_ticks": 1000, "max_ticks": 3000, "max_ticks_per_second": 150, "invert": false},
+    "elbow_flex": {"min_ticks": 1000, "max_ticks": 3000, "max_ticks_per_second": 150, "invert": false},
+    "wrist_flex": {"min_ticks": 1000, "max_ticks": 3000, "max_ticks_per_second": 150, "invert": false},
+    "wrist_roll": {"min_ticks": 1000, "max_ticks": 3000, "max_ticks_per_second": 150, "invert": false},
+    "gripper": {"min_ticks": 1000, "max_ticks": 3000, "max_ticks_per_second": 150, "invert": false}
+  }
+}

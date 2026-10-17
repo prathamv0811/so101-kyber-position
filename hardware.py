@@ -1,0 +1,280 @@
+"""Fresh SO-101 serial adapters. No dependency on the existing Tether checkout.
+
+Joint order: shoulder_pan, shoulder_lift, elbow_flex, wrist_flex, wrist_roll, gripper.
+Positions are calibrated servo register ticks, not radians or Cartesian poses.
+"""
+import argparse
+import json
+import math
+import select
+import signal
+import sys
+import time
+from pathlib import Path
+
+JOINTS = ("shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper")
+
+
+class Bus:
+    def __init__(self, port, ids):
+        import scservo_sdk as sdk
+        self.sdk = sdk
+        self.ids = ids
+        self.port = sdk.PortHandler(port)
+        self.packet = sdk.PacketHandler(0)  # STS3215: protocol 0, little-endian registers
+        if not self.port.openPort():
+            raise RuntimeError(f"Cannot open {port}")
+        if not self.port.setBaudRate(1_000_000):
+            self.close()
+            raise RuntimeError("Cannot set 1 Mbaud")
+
+    def read(self, motor, address, size):
+        fn = self.packet.read1ByteTxRx if size == 1 else self.packet.read2ByteTxRx
+        value, communication, error = fn(self.port, motor, address)
+        if communication != self.sdk.COMM_SUCCESS or error:
+            raise RuntimeError(f"Motor {motor}, register {address}: communication={communication}, error={error}")
+        return value
+
+    def write(self, motor, address, value, size=1):
+        fn = self.packet.write1ByteTxRx if size == 1 else self.packet.write2ByteTxRx
+        communication, error = fn(self.port, motor, address, value)
+        if communication != self.sdk.COMM_SUCCESS or error:
+            raise RuntimeError(f"Motor {motor} write failed: communication={communication}, error={error}")
+
+    def positions(self):
+        values = [self.read(motor, 56, 2) for motor in self.ids]
+        if any(not 0 <= value <= 4095 for value in values):
+            raise RuntimeError("Position outside single-turn range")
+        return values
+
+    def require_passive(self):
+        if any(self.read(motor, 40, 1) != 0 for motor in self.ids):
+            raise RuntimeError("Torque is enabled; support the arm and disable it locally first")
+
+    def stop(self):
+        errors = []
+        # Try ALL motors, including when an earlier motor fails communication.
+        for motor in self.ids:
+            try:
+                self.write(motor, 40, 0)
+            except Exception as exc:
+                errors.append(str(exc))
+        for motor in self.ids:
+            try:
+                if self.read(motor, 40, 1) != 0:
+                    errors.append(f"Motor {motor} torque remains enabled")
+            except Exception as exc:
+                errors.append(str(exc))
+        if errors:
+            raise RuntimeError("STOP NOT CONFIRMED; use local power cutoff: " + "; ".join(errors))
+
+    def close(self):
+        self.port.closePort()
+
+
+def calibration(path):
+    data = json.loads(Path(path).read_text())
+    if set(data) != set(JOINTS):
+        raise ValueError("Calibration must name exactly the six SO-101 joints")
+    result = [data[name] for name in JOINTS]
+    ids = []
+    for item in result:
+        if set(item) != {"id", "drive_mode", "homing_offset", "range_min", "range_max"}:
+            raise ValueError("Unexpected calibration fields")
+        if any(type(v) is not int for v in item.values()):
+            raise ValueError("Calibration values must be integers")
+        if not (1 <= item["id"] <= 253 and item["drive_mode"] == 0
+                and -2047 <= item["homing_offset"] <= 2047
+                and 0 <= item["range_min"] < item["range_max"] <= 4095):
+            raise ValueError("Invalid STS3215 calibration")
+        ids.append(item["id"])
+    if len(set(ids)) != 6:
+        raise ValueError("Duplicate motor IDs")
+    return result
+
+
+def verify_calibration(bus, cal):
+    for motor in cal:
+        # Do not change servo configuration. A mismatch requires local calibration.
+        raw = bus.read(motor["id"], 31, 2)
+        offset = -(raw & 2047) if raw & 2048 else raw
+        if offset != motor["homing_offset"] or bus.read(motor["id"], 33, 1) != 0:
+            raise RuntimeError(f"Motor {motor['id']}: saved offset/mode doesn't match hardware")
+        if bus.read(motor["id"], 3, 2) != 777:
+            raise RuntimeError(f"Motor {motor['id']}: expected STS3215 model 777")
+
+
+def leader(args):
+    cal = calibration(args.calibration)
+    bus = Bus(args.port, [m["id"] for m in cal])
+    try:
+        bus.require_passive()
+        verify_calibration(bus, cal)
+        period = 1 / args.hz
+        deadline = time.monotonic()
+        while True:
+            captured = time.time_ns()  # includes serial acquisition time in freshness checks
+            bus.require_passive()
+            positions = bus.positions()
+            if any(not m["range_min"] <= p <= m["range_max"] for m, p in zip(cal, positions)):
+                raise RuntimeError("Leader outside its calibrated range")
+            print(json.dumps({"captured_unix_ns": captured, "positions": positions}), flush=True)
+            deadline = max(deadline + period, time.monotonic())
+            time.sleep(max(0, deadline - time.monotonic()))
+    finally:
+        bus.close()  # Reader never changes torque, offsets or mode.
+
+
+class PositionController:
+    def __init__(self, config, leader_cal, follower_cal, measured):
+        if config.get("limits_reviewed") is not True:
+            raise ValueError("Review physical limits before setting limits_reviewed=true")
+        self.leader_cal = leader_cal
+        self.follower_cal = follower_cal
+        self.limits = config["joints"]
+        if set(self.limits) != set(JOINTS):
+            raise ValueError("Provide limits for all six joints")
+        for i, name in enumerate(JOINTS):
+            limit = self.limits[name]
+            lo, hi = limit["min_ticks"], limit["max_ticks"]
+            speed = limit["max_ticks_per_second"]
+            if not (type(lo) is int and type(hi) is int
+                    and follower_cal[i]["range_min"] <= lo < hi <= follower_cal[i]["range_max"]
+                    and lo <= measured[i] <= hi and type(speed) in (int, float)
+                    and math.isfinite(speed) and 0 < speed <= 1000
+                    and type(limit["invert"]) is bool):
+                raise ValueError(f"Invalid physical limits for {name}")
+        self.origin = list(measured)
+        self.anchor = None
+        self.previous_seq = 0
+        self.last = time.monotonic()
+
+    def target(self, sample, measured):
+        now = time.monotonic()
+        age = time.time_ns() - sample["received_unix_ns"]
+        if sample["version"] != 1 or not 0 <= age <= 100_000_000:
+            raise ValueError("Stale or unsupported receiver sample")
+        if type(sample["seq"]) is not int or sample["seq"] <= self.previous_seq:
+            raise ValueError("Duplicate/reordered sample")
+        positions = sample["positions"]
+        if len(positions) != 6 or any(type(p) is not int or not m["range_min"] <= p <= m["range_max"]
+                                     for p, m in zip(positions, self.leader_cal)):
+            raise ValueError("Leader sample outside calibrated limits")
+        if self.anchor is None:
+            self.anchor = list(positions)
+        targets = []
+        dt = min(now - self.last, 0.05)  # Scheduling delays never permit a large catch-up step.
+        for i, name in enumerate(JOINTS):
+            limit, lc, fc = self.limits[name], self.leader_cal[i], self.follower_cal[i]
+            if not limit["min_ticks"] <= measured[i] <= limit["max_ticks"]:
+                raise ValueError(f"Follower {name} outside reviewed limits")
+            ratio = (positions[i] - self.anchor[i]) / (lc["range_max"] - lc["range_min"])
+            if limit["invert"]:
+                ratio = -ratio
+            desired = self.origin[i] + ratio * (fc["range_max"] - fc["range_min"])
+            desired = max(limit["min_ticks"], min(limit["max_ticks"], desired))
+            step = limit["max_ticks_per_second"] * dt
+            # floor avoids rounding a sub-tick bound up into excessive movement.
+            step = math.floor(step)
+            targets.append(round(max(measured[i] - step, min(measured[i] + step, desired))))
+        self.previous_seq = sample["seq"]
+        self.last = now
+        return targets
+
+
+def read_sample(timeout):
+    # Use unbuffered OS reads, so select cannot miss data prefetched by TextIOWrapper.
+    import os
+    deadline = time.monotonic() + timeout
+    line = bytearray()
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not select.select([sys.stdin.fileno()], [], [], remaining)[0]:
+            raise TimeoutError("Position input watchdog expired")
+        byte = os.read(sys.stdin.fileno(), 1)
+        if not byte:
+            raise EOFError("Receiver disconnected")
+        if byte == b"\n":
+            return json.loads(line)
+        line.extend(byte)
+        if len(line) > 2048:
+            raise ValueError("Oversized receiver record")
+
+
+def drive(args):
+    if not (args.enable_motion and args.attended):
+        raise ValueError("Physical operation requires --attended --enable-motion")
+    config = json.loads(Path(args.config).read_text())
+    lc, fc = calibration(args.leader_calibration), calibration(args.follower_calibration)
+    # Validate reviewed config before opening any hardware.
+    if config.get("limits_reviewed") is not True:
+        raise ValueError("Physical limits have not been reviewed")
+    validation_pose = [(config["joints"][name]["min_ticks"] + config["joints"][name]["max_ticks"]) // 2
+                       for name in JOINTS]
+    PositionController(config, lc, fc, validation_pose)
+    bus = Bus(args.port, [m["id"] for m in fc])
+    touched = False
+    try:
+        bus.require_passive()
+        verify_calibration(bus, fc)
+        initial = bus.positions()
+        controller = PositionController(config, lc, fc, initial)
+        first = read_sample(0.2)
+        controller.target(first, initial)  # Validate fresh input and anchor before torque.
+        touched = True
+        for motor, position in zip(bus.ids, initial):
+            bus.write(motor, 42, position, 2)  # preload present position before torque-on
+        for motor in bus.ids:
+            bus.write(motor, 40, 1)
+        if any(bus.read(motor, 40, 1) != 1 for motor in bus.ids):
+            raise RuntimeError("Torque enable could not be verified")
+        print("Following enabled; Ctrl+C stops and disables torque", file=sys.stderr)
+        while True:
+            sample = read_sample(0.2)
+            targets = controller.target(sample, bus.positions())
+            # A sample carries a server challenge bounded to 200 ms. Each hardware
+            # cycle must finish within 100 ms; a local read/write fault ends the session.
+            started = time.monotonic()
+            for motor, target in zip(bus.ids, targets):
+                bus.write(motor, 42, target, 2)
+                if time.monotonic() - started > 0.1:
+                    raise TimeoutError("Motor write cycle exceeded 100 ms")
+    finally:
+        try:
+            if touched:
+                bus.stop()
+                print("stop_confirmed=true", file=sys.stderr)
+        finally:
+            bus.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    read = commands.add_parser("leader", help="Read a passive leader and emit position NDJSON")
+    read.add_argument("--port", required=True)
+    read.add_argument("--calibration", required=True)
+    read.add_argument("--hz", type=int, choices=range(10, 121), default=30, metavar="10..120")
+    follow = commands.add_parser("drive", help="Consume receiver NDJSON and follow with bounded relative motion")
+    follow.add_argument("--port", required=True)
+    follow.add_argument("--config", required=True)
+    follow.add_argument("--leader-calibration", required=True)
+    follow.add_argument("--follower-calibration", required=True)
+    follow.add_argument("--attended", action="store_true")
+    follow.add_argument("--enable-motion", action="store_true")
+    args = parser.parse_args()
+    # SIGTERM follows the same torque-off cleanup as Ctrl+C.
+    def terminate(_signum, _frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, terminate)
+    try:
+        (leader if args.command == "leader" else drive)(args)
+    except (KeyboardInterrupt, BrokenPipeError):
+        return
+    except Exception as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

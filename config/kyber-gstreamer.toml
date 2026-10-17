@@ -1,0 +1,17 @@
+# Native Kyber 0.29 kyavservice configuration, for use with the full Kyber app.
+# This project uses camera.py/appsink for its independent lightweight JPEG path.
+[kyavserver]
+backend = "libavconv"
+grab_backend = "gstreamer"
+
+[kyavserver.gstreamer]
+default_source = "robot-camera"
+
+[[kyavserver.gstreamer.video_sources]]
+name = "robot-camera"
+source = "v4l2src device=/dev/video0"
+width = 640
+height = 480
+framerate = "30/1"
+format = "NV12"
+mode = "raw"

@@ -1,0 +1,8 @@
+/vendor/
+/.cache/
+/.venv/
+/target/
+/credentials/
+/recordings/
+*.local.json
+__pycache__/
