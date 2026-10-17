@@ -61,3 +61,10 @@ Higher sample rate does not raise the reviewed per-second motion limit.
 Setting a joint's `max_ticks_per_second` to `null` disables only its time-based
 ramp. An explicit `max_tracking_error_ticks` is required in that case; this
 measured-position guard and LeRobot's `max_relative_target` remain active.
+
+Per-process rate/timing windows and per-joint clamp counts are documented in the
+[latency investigation](control-latency.md). Camera status is polled on a worker;
+the motor thread still rejects expired frame-derived deadlines. The complete
+read/control/send cycle must finish within 100 ms, with a second command-age
+check just before sending. Both protective motor reads and all retry settings
+remain intact.

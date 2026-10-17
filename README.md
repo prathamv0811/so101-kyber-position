@@ -131,6 +131,11 @@ logs, and `actions.jsonl`. Motor logs report actual update rate, input action,
 measured observation, and target once per second. Journals contain received
 leader actions, not measured follower telemetry or proof of execution. Actual
 rate depends on Wi-Fi/Tailscale, USB, and scheduling; 120 Hz is the requested rate.
+The requested rate accepts 10–500 Hz, with 120 Hz retained as the default.
+Use measured I/O timings before increasing it. Each process now emits
+`CONTROL_METRICS` timing/rate windows; motor logs identify per-joint clamp reasons.
+Camera status polling runs off the motor thread while retaining the 500 ms expiry.
+See [control latency investigation and local configuration review](docs/control-latency.md).
 
 ```bash
 source scripts/build-env.sh
@@ -183,6 +188,8 @@ elapsed-time speed cap. Calibrated bounds, stale-input checks, and disconnect
 stops still apply. Motion logs
 print the active speeds; Mac `leader.log` prints measured sampling rate and the
 maximum acquisition time each second.
+The example explicitly configures `max_tracking_error_ticks` so reviewing a speed
+value does not silently alter the separate tracking/relative-target protection.
 
 See [LICENSE](LICENSE) for AGPL-3.0-or-later; upstream components retain their own
 license notices.

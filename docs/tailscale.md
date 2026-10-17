@@ -68,3 +68,6 @@ clients and rebuild both sides. The follower approaches the leader’s absolute
 pose under reviewed bounds and speeds, rather than anchoring relative movement.
 Commands publish continuously at the requested rate; they no longer wait for
 an acknowledgement on every cycle. Freshness beacons still expire after 200 ms.
+Use the [control diagnostics guide](control-latency.md) to distinguish network
+arrival gaps, local motor I/O time and motion clamps. The target rate is not a
+measurement of achieved follower rate or one-way network latency.

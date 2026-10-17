@@ -17,6 +17,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 const ALPN: &[u8] = b"so101-lerobot-action-datagram-v4";
 const FRAME_LEN: usize = 24 + 6 * 8;
 const DEADLINE: Duration = Duration::from_millis(200);
+const MAX_CONTROL_HZ: u32 = 500;
 const JOINTS: [&str; 6] = [
     "shoulder_pan.pos",
     "shoulder_lift.pos",
@@ -107,6 +108,62 @@ fn now_ns() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos() as u64
+}
+
+struct LoopMetrics {
+    started: Instant,
+    samples: u64,
+    values: BTreeMap<String, (f64, f64)>,
+    counters: BTreeMap<String, u64>,
+}
+impl LoopMetrics {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            samples: 0,
+            values: BTreeMap::new(),
+            counters: BTreeMap::new(),
+        }
+    }
+    fn count(&mut self, name: &str, value: u64) {
+        *self.counters.entry(name.into()).or_default() += value;
+    }
+    fn record(&mut self, values: &[(&str, f64)]) {
+        self.samples += 1;
+        for &(name, value) in values {
+            let (sum, maximum) = self.values.entry(name.into()).or_default();
+            *sum += value;
+            *maximum = maximum.max(value);
+        }
+    }
+    fn report(&mut self, role: &str, force: bool) {
+        let elapsed = self.started.elapsed().as_secs_f64();
+        if elapsed < 1.0 && !force {
+            return;
+        }
+        if self.samples > 0 {
+            let measurements: BTreeMap<_, _> = self
+                .values
+                .iter()
+                .map(|(name, (sum, maximum))| {
+                    (
+                        name,
+                        serde_json::json!({"mean":sum / self.samples as f64,"max":maximum}),
+                    )
+                })
+                .collect();
+            eprintln!(
+                "CONTROL_METRICS {}",
+                serde_json::json!({"role":role,"samples":self.samples,
+                "interval_s":elapsed,"rate_hz":self.samples as f64 / elapsed,
+                "measurements":measurements,"counters":self.counters})
+            );
+        }
+        self.started = Instant::now();
+        self.samples = 0;
+        self.values.clear();
+        self.counters.clear();
+    }
 }
 
 fn validate_action(action: &BTreeMap<String, f64>) -> Result<()> {
@@ -228,7 +285,10 @@ async fn receive(
     insecure_lan: bool,
     hz: u32,
 ) -> Result<()> {
-    ensure!((10..=120).contains(&hz), "hz must be 10..120");
+    ensure!(
+        (10..=MAX_CONTROL_HZ).contains(&hz),
+        "hz must be 10..{MAX_CONTROL_HZ}"
+    );
     // Refuse overwrite; opening before accepting a client catches storage errors early.
     let mut journal = OpenOptions::new()
         .write(true)
@@ -260,6 +320,7 @@ async fn receive(
     let period = Duration::from_secs_f64(1.0 / hz as f64);
     let mut delivery_clock = tokio::time::Instant::now();
     let mut stop = [0];
+    let mut diagnostics = LoopMetrics::new();
     let outcome: Result<()> = async {
         loop {
             tokio::select! {
@@ -280,11 +341,14 @@ async fn receive(
                     ensure!(frame.len() == FRAME_LEN, "Invalid action datagram length");
                     let nonce = u64::from_be_bytes(frame[..8].try_into()?);
                     let incoming_seq = u64::from_be_bytes(frame[8..16].try_into()?);
+                    diagnostics.count("received_datagrams", 1);
                     // Datagram loss/reordering is normal. Neither old sequence numbers
                     // nor an expired challenge can refresh the input watchdog.
-                    if incoming_seq <= seq { continue; }
-                    let Some(age) = challenges.age(nonce, Instant::now()) else { continue; };
+                    if incoming_seq <= seq { diagnostics.count("old_sequence", 1); continue; }
+                    let Some(age) = challenges.age(nonce, Instant::now()) else { diagnostics.count("expired_challenge", 1); continue; };
                     let (new_seq, sample) = decode(&frame, nonce, seq)?;
+                    diagnostics.count("sequence_gaps", new_seq - seq - 1);
+                    if pending.is_some() { diagnostics.count("coalesced_delivery", 1); }
                     seq = new_seq;
                     last_input = tokio::time::Instant::now();
                     pending = Some((new_seq, sample, now_ns(), age));
@@ -303,12 +367,16 @@ async fn receive(
                     writeln!(journal, "{line}")?;
                     println!("{line}");
                     delivered += 1;
+                    diagnostics.record(&[("delivery_queue_ms", now_ns().saturating_sub(received) as f64 / 1e6),
+                        ("challenge_age_ms", age.as_secs_f64() * 1000.0)]);
                     delivery_clock = delivery_clock.max(tokio::time::Instant::now()) + period;
                 }
             }
+            diagnostics.report("receiver", false);
         }
     }.await;
     conn.close(0, "Position session ended; do not auto-resume motion");
+    diagnostics.report("receiver", true);
     journal.sync_all()?;
     eprintln!("Session ended after {delivered} delivered samples (last sequence {seq})");
     outcome
@@ -325,8 +393,8 @@ async fn publish(
 ) -> Result<()> {
     tls::address(remote, insecure_lan)?;
     ensure!(
-        (10..=120).contains(&hz),
-        "hz must be 10..120 to meet the watchdog deadline"
+        (10..=MAX_CONTROL_HZ).contains(&hz),
+        "hz must be 10..{MAX_CONTROL_HZ} to meet the watchdog deadline"
     );
     ensure!(
         seconds.is_none_or(|s| s.is_finite() && s > 0.0),
@@ -392,6 +460,8 @@ async fn publish(
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut seq = 0;
     let mut challenge = None;
+    let mut diagnostics = LoopMetrics::new();
+    let mut previous_capture = None;
     let outcome: Result<()> = async {
         loop {
             tokio::select! {
@@ -449,11 +519,24 @@ async fn publish(
             );
             seq += 1;
             let frame = encode(nonce, seq, &sample)?;
+            if previous_capture != Some(sample.captured_unix_ns) {
+                diagnostics.count("unique_source_samples", 1);
+                previous_capture = Some(sample.captured_unix_ns);
+            }
             conn.send_datagram(bytes::Bytes::from(frame)).await?;
+            diagnostics.record(&[
+                ("source_age_ms", age as f64 / 1e6),
+                (
+                    "beacon_arrival_age_ms",
+                    received.elapsed().as_secs_f64() * 1000.0,
+                ),
+            ]);
+            diagnostics.report("publisher", false);
         }
         Ok(())
     }
     .await;
+    diagnostics.report("publisher", true);
     if outcome.is_ok() {
         tokio::time::timeout(DEADLINE, send.write_all(b"S")).await??;
         tokio::time::timeout(Duration::from_secs(1), conn.closed()).await??;

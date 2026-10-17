@@ -14,7 +14,11 @@ import sys
 import time
 from pathlib import Path
 
+from diagnostics import LoopMetrics
+from video_watchdog import VideoWatchdog, video_deadlines
+
 JOINTS = ("shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper")
+MAX_CONTROL_HZ = 500
 
 
 ACTION_KEYS = tuple(f"{name}.pos" for name in JOINTS)
@@ -183,20 +187,22 @@ def leader(args):
         print(f"LeRobot SO-101 leader ready at {args.hz} Hz on {args.port}", file=sys.stderr)
         period = 1 / args.hz
         deadline = time.monotonic()
-        reported, updates, maximum_cycle = deadline, 0, 0
+        diagnostics = LoopMetrics("leader")
         while True:
             cycle = time.monotonic()
             captured = time.time_ns()  # includes serial acquisition time in freshness checks
             bus.require_passive()
+            passive_done = time.monotonic()
             action = bus.get_action()
+            acquisition_done = time.monotonic()
             print(json.dumps({"captured_unix_ns": captured, "action": action}), flush=True)
             now = time.monotonic()
-            updates += 1
-            maximum_cycle = max(maximum_cycle, now - cycle)
-            if now - reported >= 1:
-                print(f"Leader sampling rate={updates / (now - reported):.1f} Hz "
-                      f"max_acquisition_ms={maximum_cycle * 1000:.1f}", file=sys.stderr)
-                reported, updates, maximum_cycle = now, 0, 0
+            report = diagnostics.record({"passive_check_ms": (passive_done - cycle) * 1000,
+                "position_read_ms": (acquisition_done - passive_done) * 1000,
+                "acquisition_ms": (acquisition_done - cycle) * 1000,
+                "source_emit_ms": (now - acquisition_done) * 1000})
+            if report:
+                print("CONTROL_METRICS " + json.dumps(report), file=sys.stderr)
             deadline = max(deadline + period, time.monotonic())
             time.sleep(max(0, deadline - time.monotonic()))
     finally:
@@ -239,12 +245,13 @@ class LeRobotControls:
         self.command = dict(measured)
         self.previous_seq = 0
         self.last = time.monotonic()
+        self.last_clamps = {}
 
     def target(self, sample, measured):
         from lerobot.robots.utils import ensure_safe_goal_position
         now = time.monotonic()
-        age = time.time_ns() - sample["received_unix_ns"]
-        if sample["version"] != 3 or sample.get("units") != "lerobot_degrees_gripper_percent" or not 0 <= age <= 100_000_000:
+        require_command_freshness(sample)
+        if sample["version"] != 3 or sample.get("units") != "lerobot_degrees_gripper_percent":
             raise ValueError("Stale or unsupported receiver sample")
         if type(sample["seq"]) is not int or sample["seq"] <= self.previous_seq:
             raise ValueError("Duplicate/reordered sample")
@@ -252,6 +259,7 @@ class LeRobotControls:
         validate_action(measured)
         dt = max(0, min(now - self.last, 0.05))
         goals, steps = {}, {}
+        self.last_clamps = {}
         for name in JOINTS:
             key = f"{name}.pos"
             if not self.lower[key] - 1e-9 <= measured[key] <= self.upper[key] + 1e-9:
@@ -259,6 +267,8 @@ class LeRobotControls:
             if abs(self.command[key] - measured[key]) > self.tracking_limits[name] + self.units_per_tick[name]:
                 raise RuntimeError(f"Follower {name} tracking error exceeded bound")
             goal = max(self.lower[key], min(self.upper[key], desired[key]))
+            if abs(goal - desired[key]) > 1e-9:
+                self.last_clamps[f"physical_bounds.{name}"] = 1
             if self.speeds[name] is None:
                 # No elapsed-time speed ramp. Retain the same reviewed maximum
                 # target offset from measured position, also enforced by LeRobot.
@@ -267,6 +277,9 @@ class LeRobotControls:
             else:
                 goals[key] = (goal, self.command[key])
                 steps[key] = self.speeds[name] * dt * self.units_per_tick[name]
+            if abs(goal - goals[key][1]) > steps[key] + 1e-9:
+                kind = "relative_target" if self.speeds[name] is None else "speed_ramp"
+                self.last_clamps[f"{kind}.{name}"] = 1
         self.command = ensure_safe_goal_position(goals, steps)
         self.previous_seq, self.last = sample["seq"], now
         return dict(self.command)
@@ -283,6 +296,7 @@ class SampleReader:
     """
     def __init__(self, fd):
         self.fd, self.buffer, self.eof = fd, bytearray(), False
+        self.coalesced = 0
 
     def read(self, timeout):
         deadline = time.monotonic() + timeout
@@ -293,6 +307,8 @@ class SampleReader:
                 self.buffer = bytearray(rest)
                 if len(line) > 2048:
                     raise ValueError("Oversized receiver record")
+                if latest is not None:
+                    self.coalesced += 1
                 latest = json.loads(line)
             if len(self.buffer) > 2048:
                 raise ValueError("Oversized receiver record")
@@ -342,11 +358,44 @@ def first_sample(timeout=30):
 
 
 def require_video(paths):
-    for path in paths:
-        data = json.loads(Path(path).read_text())
-        age = time.time_ns() - data["updated_unix_ns"]
-        if not (data["frames"] > 0 and 0 <= age <= 500_000_000):
-            raise RuntimeError(f"Camera stream stale or unavailable: {Path(path).name}")
+    video_deadlines(paths)
+
+
+def require_command_freshness(sample):
+    age = time.time_ns() - sample["received_unix_ns"]
+    if not 0 <= age <= 100_000_000:
+        raise ValueError("Stale receiver sample")
+    return age / 1e6
+
+
+def motor_cycle(bus, controller, sample, video, clock=None):
+    clock = clock or time.monotonic
+    started = clock()
+    measured = bus.get_observation()
+    read_done = clock()
+    targets = controller.target(sample, measured)
+    video.check()
+    command_age = require_command_freshness(sample)  # Recheck immediately before I/O.
+    send_started = clock()
+    if send_started - started > .1:
+        raise TimeoutError("Motor read/control cycle exceeded 100 ms")
+    actual = bus.send_action(targets)
+    finished = clock()
+    if finished - send_started > .1:
+        raise TimeoutError("Motor write cycle exceeded 100 ms")
+    if finished - started > .1:
+        raise TimeoutError("Motor cycle exceeded 100 ms")
+    controller.sent(actual)
+    counters = dict(controller.last_clamps)
+    for name in JOINTS:
+        key = f"{name}.pos"
+        if abs(actual[key] - targets[key]) > 1e-9:
+            counters[f"lerobot_relative_target.{name}"] = 1
+    return measured, targets, {"motor_read_ms": (read_done - started) * 1000,
+        "control_watchdog_ms": (send_started - read_done) * 1000,
+        "motor_send_ms": (finished - send_started) * 1000,
+        "motor_cycle_ms": (finished - started) * 1000,
+        "command_age_ms": command_age}, counters
 
 
 def drive(args):
@@ -364,6 +413,7 @@ def drive(args):
     print("Tracking bounds (native units): " + json.dumps(validated.tracking_limits), file=sys.stderr)
     bus = Bus(args.port, [m["id"] for m in fc], args.follower_calibration, "follower")
     touched = False
+    video = None
     try:
         bus.require_passive()
         verify_calibration(bus, fc)
@@ -374,7 +424,9 @@ def drive(args):
         controller = LeRobotControls(config, fc, initial)
         controller.target(first, initial)  # Validate input before enabling torque.
         bus.arm.config.max_relative_target = controller.tracking_limits
-        require_video(getattr(args, "video_status", []))
+        video = VideoWatchdog(getattr(args, "video_status", []))
+        video.check()
+        require_command_freshness(first)
         touched = True
         bus.send_action(initial)  # preload present pose through LeRobot before torque-on
         for motor in bus.ids:
@@ -382,32 +434,33 @@ def drive(args):
         if any(bus.read(motor, 40, 1) != 1 for motor in bus.ids):
             raise RuntimeError("Torque enable could not be verified")
         print("Following enabled; Ctrl+C stops and disables torque", file=sys.stderr)
-        reported = time.monotonic()
-        updates = 0
+        diagnostics = LoopMetrics("follower")
+        previous_coalesced = 0
         while True:
+            wait_started = time.monotonic()
             sample = read_sample(0.2)
-            measured = bus.get_observation()
-            targets = controller.target(sample, measured)
-            require_video(getattr(args, "video_status", []))
-            # A sample carries a server challenge bounded to 200 ms. Each hardware
-            # cycle must finish within 100 ms; a local read/write fault ends the session.
-            started = time.monotonic()
-            controller.sent(bus.send_action(targets))
-            if time.monotonic() - started > 0.1:
-                raise TimeoutError("Motor write cycle exceeded 100 ms")
-            updates += 1
-            now = time.monotonic()
-            if now - reported >= 1:
-                print(f"Following rate={updates / (now - reported):.1f} Hz leader={sample['action']} "
+            input_wait = (time.monotonic() - wait_started) * 1000
+            measured, targets, timings, counters = motor_cycle(bus, controller, sample, video)
+            timings["input_wait_ms"] = input_wait
+            coalesced = _sample_reader.coalesced if _sample_reader is not None else 0
+            counters["coalesced_input"] = coalesced - previous_coalesced
+            previous_coalesced = coalesced
+            report = diagnostics.record(timings, counters)
+            if report:
+                print("CONTROL_METRICS " + json.dumps(report), file=sys.stderr)
+                print(f"Following rate={report['rate_hz']:.1f} Hz leader={sample['action']} "
                       f"measured={measured} target={targets}", file=sys.stderr)
-                reported, updates = now, 0
     finally:
         try:
             if touched:
                 bus.stop()
                 print("stop_confirmed=true", file=sys.stderr)
         finally:
-            bus.close()
+            try:
+                if video is not None:
+                    video.close()
+            finally:
+                bus.close()
 
 
 def main():
@@ -416,7 +469,7 @@ def main():
     read = commands.add_parser("leader", help="Read native LeRobot SO-101 actions from a passive leader")
     read.add_argument("--port", required=True)
     read.add_argument("--calibration", required=True)
-    read.add_argument("--hz", type=int, choices=range(10, 121), default=120, metavar="10..120")
+    read.add_argument("--hz", type=int, choices=range(10, MAX_CONTROL_HZ + 1), default=120, metavar="10..500")
     follow = commands.add_parser("drive", help="Apply native LeRobot actions from the Kyber server")
     follow.add_argument("--port", required=True)
     follow.add_argument("--config", required=True)
