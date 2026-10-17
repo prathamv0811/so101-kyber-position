@@ -1,5 +1,8 @@
 # MacBook leader → Ubuntu follower over LAN
 
+For remote access using this laptop’s **100.79.3.30** address, use the
+[Tailscale guide](tailscale.md).
+
 The public repository is https://github.com/prathamv0811/so101-kyber-position.
 The follower laptop's observed Wi-Fi address is **192.168.101.50**. Both computers
 must be on the same reachable Wi-Fi network. A guest network may isolate clients.
@@ -59,7 +62,7 @@ With the follower supported and an attendant at its power cutoff:
 ```bash
 cd /home/dev/so101-kyber-position
 source scripts/build-env.sh
-.venv/bin/python session.py follower --insecure-lan --attended --enable-motion
+.venv/bin/python session.py follower --insecure-lan --hz 60 --attended --enable-motion
 ```
 
 This starts both camera streams and the command receiver. The follower waits
@@ -77,7 +80,7 @@ In the Mac checkout, replace the USB placeholder:
 
 ```bash
 .venv/bin/python session.py operator \
-  --host 192.168.101.50 --insecure-lan \
+  --host 192.168.101.50 --insecure-lan --hz 60 \
   --port /dev/cu.usbmodemYOUR_DEVICE \
   --calibration calibration/leader.json
 ```
@@ -102,7 +105,8 @@ QUIC remains encrypted, using an automatically generated server certificate,
 but neither computer verifies peer identity. Other devices on the LAN could
 connect or impersonate a peer. This mode accepts only explicit private,
 loopback, or link-local addresses, and refuses public/wildcard bind addresses.
-Private-address checks are not a substitute for a trusted network.
+Tailscale IPv4 addresses in 100.64.0.0/10 are also supported. Private-address
+checks are not a substitute for a trusted network.
 
 For paired mutual TLS, omit `--insecure-lan`. Generate credentials on the laptop:
 
@@ -117,3 +121,10 @@ Credentials, calibration, recordings, and local profiles stay out of Git.
 If connection fails, check the laptop's current address (`ip -brief -4 address`),
 Wi-Fi client isolation, firewall UDP rules for 7445–7447, and the latest run logs.
 The software does not change firewall settings or require router port forwarding.
+
+Control defaults to **60 Hz** on both roles (`--hz 60`). The Mac passes this to
+both the LeRobot leader reader and network publisher; the listener paces
+challenges at 60 Hz and the follower updates on each accepted sample. Video
+remains 30 fps. Actual throughput depends on USB, Wi-Fi, and scheduling. The
+motor log reports measured update rate, leader values, feedback, and targets
+once per second. Speed limits remain in ticks/second, independent of sample rate.

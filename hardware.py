@@ -31,6 +31,9 @@ class Bus:
         if ids != list(range(1, 7)):
             raise ValueError("LeRobot SO-101 requires joint motor IDs 1 through 6")
         options = {"port": port, "id": path.stem, "calibration_dir": path.parent}
+        self.role = role
+        self.cal = calibration(path)
+        options["use_degrees"] = True
         self.arm = (SO101Leader(SO101LeaderConfig(**options)) if role == "leader"
                     else SO101Follower(SO101FollowerConfig(**options, cameras={})))
         self.driver = self.arm.bus
@@ -55,17 +58,42 @@ class Bus:
         self.driver.write(self.REGISTERS[address], self.name(motor), value, normalize=False, num_retry=2)
 
     def positions(self):
-        result = self.driver.sync_read("Present_Position", normalize=False, num_retry=2)
-        values = [result[name] for name in JOINTS]
+        # Use LeRobot's public arm API; its body positions are degrees and its
+        # gripper is 0..100. Convert back to ticks for our existing physical limits.
+        action = self.arm.get_action() if self.role == "leader" else self.arm.get_observation()
+        values = []
+        for name, motor in zip(JOINTS, self.cal):
+            value = action[f"{name}.pos"]
+            if not math.isfinite(value):
+                raise RuntimeError(f"Invalid LeRobot position for {name}")
+            if name == "gripper":
+                position = motor["range_min"] + value / 100 * (motor["range_max"] - motor["range_min"])
+                # LeRobot clips normalized gripper observations. At saturation,
+                # check the raw register so clipping cannot hide an out-of-range arm.
+                if value <= 0 or value >= 100:
+                    position = self.driver.read("Present_Position", name, normalize=False, num_retry=2)
+            else:
+                position = value * 4095 / 360 + (motor["range_min"] + motor["range_max"]) / 2
+            values.append(round(position))
         if any(not 0 <= value <= 4095 for value in values):
             raise RuntimeError("Position outside single-turn range")
         return values
 
     def send_positions(self, positions):
-        self.driver.sync_write("Goal_Position", dict(zip(JOINTS, positions)), normalize=False, num_retry=2)
+        if self.role != "follower":
+            raise RuntimeError("Only the follower may receive motor goals")
+        if len(positions) != 6 or any(not motor["range_min"] <= position <= motor["range_max"]
+                                      for position, motor in zip(positions, self.cal)):
+            raise ValueError("Follower action outside its calibration")
+        # Reuse the pinned LeRobot motor normalizer; send_action owns the write.
+        # The compatibility test checks its calibration/units against the real bus.
+        normalized = self.driver._normalize(dict(zip(self.ids, positions)))
+        action = {f"{name}.pos": normalized[motor] for name, motor in zip(JOINTS, self.ids)}
+        return self.arm.send_action(action)
 
     def require_passive(self):
-        if any(self.read(motor, 40, 1) != 0 for motor in self.ids):
+        torque = self.driver.sync_read("Torque_Enable", normalize=False, num_retry=2)
+        if set(torque) != set(JOINTS) or any(value != 0 for value in torque.values()):
             raise RuntimeError("Torque is enabled; support the arm and disable it locally first")
 
     def stop(self):
@@ -161,6 +189,7 @@ class PositionController:
                     and type(limit["invert"]) is bool):
                 raise ValueError(f"Invalid physical limits for {name}")
         self.origin = list(measured)
+        self.command = [float(value) for value in measured]
         self.anchor = None
         self.previous_seq = 0
         self.last = time.monotonic()
@@ -189,10 +218,17 @@ class PositionController:
                 ratio = -ratio
             desired = self.origin[i] + ratio * (fc["range_max"] - fc["range_min"])
             desired = max(limit["min_ticks"], min(limit["max_ticks"], desired))
-            step = limit["max_ticks_per_second"] * dt
-            # floor avoids rounding a sub-tick bound up into excessive movement.
-            step = math.floor(step)
-            targets.append(round(max(measured[i] - step, min(measured[i] + step, desired))))
+            # Advance a continuous goal trajectory, so sub-tick steps accumulate.
+            # Re-anchoring each target to measured position can stall inside the
+            # servo dead zone (100 ticks/s at 60 Hz previously became 1 tick).
+            speed = limit["max_ticks_per_second"]
+            lead = max(2.0, speed * 0.1)  # Bound tracking lag to 100 ms of travel, with a two-tick minimum.
+            if abs(self.command[i] - measured[i]) > lead + 1:
+                raise RuntimeError(f"Follower {name} tracking error exceeded bound")
+            desired = max(measured[i] - lead, min(measured[i] + lead, desired))
+            step = speed * dt
+            self.command[i] = max(self.command[i] - step, min(self.command[i] + step, desired))
+            targets.append(round(self.command[i]))
         self.previous_seq = sample["seq"]
         self.last = now
         return targets
@@ -274,9 +310,12 @@ def drive(args):
         if any(bus.read(motor, 40, 1) != 1 for motor in bus.ids):
             raise RuntimeError("Torque enable could not be verified")
         print("Following enabled; Ctrl+C stops and disables torque", file=sys.stderr)
+        reported = time.monotonic()
+        updates = 0
         while True:
             sample = read_sample(0.2)
-            targets = controller.target(sample, bus.positions())
+            measured = bus.positions()
+            targets = controller.target(sample, measured)
             require_video(getattr(args, "video_status", []))
             # A sample carries a server challenge bounded to 200 ms. Each hardware
             # cycle must finish within 100 ms; a local read/write fault ends the session.
@@ -284,6 +323,12 @@ def drive(args):
             bus.send_positions(targets)
             if time.monotonic() - started > 0.1:
                 raise TimeoutError("Motor write cycle exceeded 100 ms")
+            updates += 1
+            now = time.monotonic()
+            if now - reported >= 1:
+                print(f"Following rate={updates / (now - reported):.1f} Hz leader={sample['positions']} "
+                      f"measured={measured} target={targets}", file=sys.stderr)
+                reported, updates = now, 0
     finally:
         try:
             if touched:
@@ -299,7 +344,7 @@ def main():
     read = commands.add_parser("leader", help="Read a passive leader and emit position NDJSON")
     read.add_argument("--port", required=True)
     read.add_argument("--calibration", required=True)
-    read.add_argument("--hz", type=int, choices=range(10, 121), default=30, metavar="10..120")
+    read.add_argument("--hz", type=int, choices=range(10, 121), default=60, metavar="10..120")
     follow = commands.add_parser("drive", help="Consume receiver NDJSON and follow with bounded relative motion")
     follow.add_argument("--port", required=True)
     follow.add_argument("--config", required=True)

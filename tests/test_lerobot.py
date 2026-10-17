@@ -1,35 +1,61 @@
+"""Exercise actual pinned LeRobot arm methods with only physical I/O mocked."""
 import json
 import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from hardware import Bus, JOINTS
 
 
 class LeRobotAdapterTests(unittest.TestCase):
-    def test_real_lerobot_leader_class_with_fake_motor_bus(self):
-        driver = MagicMock()
-        driver.is_calibrated = True
-        driver.sync_read.return_value = dict.fromkeys(JOINTS, 2048)
+    def test_public_leader_and_follower_apis_and_units(self):
+        from lerobot.motors.feetech import FeetechMotorsBus
         data = {name: {"id": i + 1, "drive_mode": 0, "homing_offset": 0,
-                       "range_min": 0, "range_max": 4095} for i, name in enumerate(JOINTS)}
+                       "range_min": 700 + i * 10, "range_max": 3500 - i * 20}
+                for i, name in enumerate(JOINTS)}
+        raw = [1000, 1400, 1800, 2200, 2600, 3000]
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "test_leader.json"
+            path = Path(directory) / "arm.json"
             path.write_text(json.dumps(data))
-            with patch("lerobot.teleoperators.so_leader.so_leader.FeetechMotorsBus", return_value=driver):
-                bus = Bus("fake-port", list(range(1, 7)), path, "leader")
-                self.assertEqual(bus.positions(), [2048] * 6)
-                driver.sync_read.assert_called_with("Present_Position", normalize=False, num_retry=2)
-                bus.send_positions([2050] * 6)
-                driver.sync_write.assert_called_with("Goal_Position", dict.fromkeys(JOINTS, 2050), normalize=False, num_retry=2)
-                bus.close()
-            driver.connect.assert_called_once_with()
-            driver.disconnect.assert_called_once_with(disable_torque=False)
-            driver.enable_torque.assert_not_called()
-            driver.write_calibration.assert_not_called()
+            for role in ("leader", "follower"):
+                with patch.object(FeetechMotorsBus, "connect"), \
+                     patch.object(FeetechMotorsBus, "is_calibrated", property(lambda _: True)), \
+                     patch.object(FeetechMotorsBus, "is_connected", property(lambda _: True)):
+                    bus = Bus("fake-port", list(range(1, 7)), path, role)
+                    with patch.object(bus.driver, "sync_read", return_value=dict.fromkeys(JOINTS, 0)) as torque:
+                        bus.require_passive()
+                        torque.assert_called_once_with("Torque_Enable", normalize=False, num_retry=2)
+                    with patch.object(bus.driver, "sync_read", return_value=dict.fromkeys(JOINTS, 1)):
+                        with self.assertRaisesRegex(RuntimeError, "Torque is enabled"):
+                            bus.require_passive()
+                    normalized = bus.driver._normalize(dict(zip(bus.ids, raw)))
+                    reading = {name: normalized[i] for name, i in zip(JOINTS, bus.ids)}
+                    with patch.object(bus.driver, "sync_read", return_value=reading) as read:
+                        self.assertEqual(bus.positions(), raw)
+                        read.assert_called_once_with("Present_Position", num_retry=2)
+                    # Exercise actual SOFollower.send_action, not a replacement stub.
+                    with patch.object(bus.driver, "sync_write") as write:
+                        if role == "follower":
+                            sent = bus.send_positions(raw)
+                            write.assert_called_once_with("Goal_Position", reading)
+                            self.assertEqual(set(sent), {f"{name}.pos" for name in JOINTS})
+                            decoded = bus.driver._unnormalize(normalized)
+                            self.assertTrue(all(abs(decoded[i] - value) <= 1 for i, value in zip(bus.ids, raw)))
+                        else:
+                            with self.assertRaisesRegex(RuntimeError, "Only the follower"):
+                                bus.send_positions(raw)
+                            write.assert_not_called()
+                    # Saturation must not hide gripper register values beyond calibration.
+                    reading["gripper"] = 100.0
+                    with patch.object(bus.driver, "sync_read", return_value=reading), \
+                         patch.object(bus.driver, "read", return_value=data["gripper"]["range_max"] + 10):
+                        self.assertEqual(bus.positions()[-1], data["gripper"]["range_max"] + 10)
+                    with patch.object(bus.driver, "disconnect") as disconnect:
+                        bus.close()
+                        disconnect.assert_called_once_with(disable_torque=False)
 
 
 if __name__ == "__main__":

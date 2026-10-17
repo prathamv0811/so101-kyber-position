@@ -6,7 +6,8 @@ six measured motor positions through **kynput 0.29.0 input types** and the curre
 explicitly enabled SO-101 follower. GStreamer supplies top and wrist camera feeds. A combined launcher couples video health to following.
 
 **Current deployment: leader on a MacBook, follower on this Ubuntu laptop,
-connected over the same Wi-Fi LAN.** Start with the
+using Tailscale for remote access or direct Wi-Fi LAN.** Start with the
+[Tailscale remote guide](docs/tailscale.md) or the
 [MacBook-to-Ubuntu LAN guide](docs/macbook-lan.md). The laptop's observed LAN
 address is `192.168.101.50`; confirm it before connecting.
 
@@ -75,27 +76,29 @@ SDK's KyProto video channel; it does not build the full Kyber desktop/VLC app or
 its `kyavservice` executable. This is an SDK application, not a stock desktop client.
 
 
-## Dual video and motor control over LAN
+## LeRobot remote teleoperation over Tailscale
 
 On the prepared follower laptop, with the supported arm attended:
 
 ```bash
 source scripts/build-env.sh
-.venv/bin/python session.py follower --insecure-lan --attended --enable-motion
+.venv/bin/python session.py follower --listen-host 100.79.3.30 --tailscale --hz 60 --attended --enable-motion
 ```
 
 On the calibrated MacBook leader:
 
 ```bash
-.venv/bin/python session.py operator --host 192.168.101.50 --insecure-lan \
+.venv/bin/python session.py operator --host 100.79.3.30 --tailscale --hz 60 \
   --port /dev/cu.usbmodemYOUR_DEVICE --calibration calibration/leader.json
 ```
 
-No credentials need copying in LAN mode. Top video uses UDP 7446, wrist video
+No application credentials need copying in Tailscale mode; connect both devices
+to the same authorized tailnet. Top video uses UDP 7446, wrist video
 7447, and positions 7445. Both video windows start before leader publishing;
 the follower waits torque-off until fresh input and both streams are available.
-Camera loss and command loss stop following. Omit `--insecure-lan` on both
-computers to use paired mutual TLS instead. See the [LAN guide](docs/macbook-lan.md)
+Camera loss and command loss stop following. Omit `--tailscale` on both computers to use paired mutual TLS instead.
+The integration calls LeRobot `get_action`, `get_observation`, and `send_action`;
+see [LeRobot integration](docs/lerobot-integration.md). See the [LAN guide](docs/macbook-lan.md)
 for installation, calibration, local profile setup, and session restart behavior.
 
 ## Test without hardware
@@ -298,13 +301,13 @@ the defined order. The receiver checks framing, discriminants, device ID, ticks,
 sequence and challenge before calling upstream deserialization. TLS 1.3 mutual
 authentication protects both ends by default. Optional `--insecure-lan` requires
 no credential files, uses an ephemeral certificate, and skips peer identity
-verification on explicit private LAN addresses; use only on a trusted network. ALPN distinguishes positions from camera
+verification on explicit private LAN or Tailscale addresses; use only with trusted network access. ALPN distinguishes positions from camera
 frames. Position ALPN v2 rejects older raw-tick clients. This is a custom application on the Kyber SDK rather than a stock
 `kynputserver` deployment.
 
 A frame echoing the current challenge with all remaining bytes zero explicitly
 ends a position session. Both read and publish rates must be 10–120 Hz to stay
-within the watchdog budget; the default is 30 Hz.
+within the watchdog budget; the default is 60 Hz.
 
 Before a live session, the publisher waits up to 30 seconds for LeRobot's first
 sample, allowing imports and USB startup to finish before connecting. The

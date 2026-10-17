@@ -40,8 +40,8 @@ enum Command {
         listen: SocketAddr,
         #[arg(long, default_value = "credentials/server")]
         credentials: PathBuf,
-        /// Encrypted private-LAN connection without credential files or peer identity verification.
-        #[arg(long)]
+        /// Encrypted LAN/Tailscale connection without application credentials or peer identity verification.
+        #[arg(long, alias = "tailscale")]
         insecure_lan: bool,
         #[arg(long)]
         status_file: Option<PathBuf>,
@@ -52,8 +52,8 @@ enum Command {
         remote: SocketAddr,
         #[arg(long, default_value = "credentials/leader")]
         credentials: PathBuf,
-        /// Encrypted private-LAN connection without credential files or peer identity verification.
-        #[arg(long)]
+        /// Encrypted LAN/Tailscale connection without application credentials or peer identity verification.
+        #[arg(long, alias = "tailscale")]
         insecure_lan: bool,
         #[arg(long, default_value = "so101-server")]
         server_name: String,
@@ -66,11 +66,14 @@ enum Command {
         listen: SocketAddr,
         #[arg(long, default_value = "credentials/server")]
         credentials: PathBuf,
-        /// Encrypted private-LAN connection without credential files or peer identity verification.
-        #[arg(long)]
+        /// Encrypted LAN/Tailscale connection without application credentials or peer identity verification.
+        #[arg(long, alias = "tailscale")]
         insecure_lan: bool,
         #[arg(long)]
         output: PathBuf,
+        /// Maximum command challenge rate; follower updates follow accepted samples.
+        #[arg(long, default_value_t = 60)]
+        hz: u32,
     },
     /// Publish NDJSON samples from stdin, or generate a hardware-free signal.
     Publish {
@@ -78,8 +81,8 @@ enum Command {
         remote: SocketAddr,
         #[arg(long, default_value = "credentials/leader")]
         credentials: PathBuf,
-        /// Encrypted private-LAN connection without credential files or peer identity verification.
-        #[arg(long)]
+        /// Encrypted LAN/Tailscale connection without application credentials or peer identity verification.
+        #[arg(long, alias = "tailscale")]
         insecure_lan: bool,
         #[arg(long, default_value = "so101-server")]
         server_name: String,
@@ -87,7 +90,7 @@ enum Command {
         simulate: bool,
         #[arg(long)]
         seconds: Option<f64>,
-        #[arg(long, default_value_t = 30)]
+        #[arg(long, default_value_t = 60)]
         hz: u32,
     },
 }
@@ -197,7 +200,9 @@ async fn receive(
     credentials: &Path,
     output: &Path,
     insecure_lan: bool,
+    hz: u32,
 ) -> Result<()> {
+    ensure!((10..=120).contains(&hz), "hz must be 10..120");
     // Refuse overwrite; opening before accepting a client catches storage errors early.
     let mut journal = OpenOptions::new()
         .write(true)
@@ -207,7 +212,7 @@ async fn receive(
     let config = tls::server(credentials, insecure_lan, ALPN)?;
     let endpoint = quinn::Endpoint::server(config, listen)?;
     eprintln!(
-        "Listening on {} (record only; one publisher per session)",
+        "Listening on {} (record only; one publisher per session; max {hz} Hz)",
         endpoint.local_addr()?
     );
     let incoming = endpoint.accept().await.context("Listener closed")?;
@@ -221,8 +226,11 @@ async fn receive(
     ensure!(marker == *b"P", "Invalid protocol marker");
     let mut seq = 0;
     let mut challenge = 1u64;
+    let mut interval = tokio::time::interval(Duration::from_secs_f64(1.0 / hz as f64));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let outcome: Result<()> = async {
         loop {
+            interval.tick().await;
             let issued = Instant::now();
             let mut frame = [0u8; FRAME_LEN];
             tokio::time::timeout(DEADLINE, async {
@@ -415,7 +423,8 @@ async fn main() -> Result<()> {
             credentials,
             insecure_lan,
             output,
-        } => receive(listen, &credentials, &output, insecure_lan).await,
+            hz,
+        } => receive(listen, &credentials, &output, insecure_lan, hz).await,
         Command::Publish {
             remote,
             credentials,

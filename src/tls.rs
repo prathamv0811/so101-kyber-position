@@ -13,12 +13,17 @@ use std::{
 
 pub fn address(address: SocketAddr, insecure: bool) -> Result<()> {
     let private = match address.ip() {
-        IpAddr::V4(ip) => ip.is_private() || ip.is_loopback() || ip.is_link_local(),
+        IpAddr::V4(ip) => {
+            ip.is_private()
+                || ip.is_loopback()
+                || ip.is_link_local()
+                || (ip.octets()[0] == 100 && (64..=127).contains(&ip.octets()[1]))
+        }
         IpAddr::V6(ip) => ip.is_unique_local() || ip.is_loopback() || ip.is_unicast_link_local(),
     };
     ensure!(
         !insecure || private,
-        "--insecure-lan requires an explicit private LAN or loopback address"
+        "--insecure-lan requires an explicit private LAN, Tailscale, or loopback address"
     );
     Ok(())
 }
@@ -129,6 +134,8 @@ mod tests {
             "8.8.8.8:7445",
             "[::]:7445",
             "[2606:4700::1111]:7445",
+            "100.63.255.255:7445",
+            "100.128.0.0:7445",
         ] {
             assert!(super::address(addr.parse().unwrap(), true).is_err());
             assert!(super::address(addr.parse().unwrap(), false).is_ok());
@@ -136,6 +143,9 @@ mod tests {
         for addr in [
             "192.168.101.50:7445",
             "127.0.0.1:7445",
+            "100.64.0.1:7445",
+            "100.79.3.30:7445",
+            "100.127.255.254:7445",
             "[::1]:7445",
             "[fd00::1]:7445",
         ] {

@@ -4,7 +4,6 @@ import unittest
 import tempfile
 import json
 from argparse import Namespace
-from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -36,6 +35,23 @@ class ControllerTests(unittest.TestCase):
             target = control.target(self.sample(2, [4000] * 6), [2000] * 6)
         self.assertTrue(2000 < target[0] <= 2008)
         self.assertTrue(1992 <= target[1] < 2000)
+
+    def test_60hz_accumulates_sub_tick_goals_and_caps_tracking_error(self):
+        for limit in self.config["joints"].values():
+            limit["max_ticks_per_second"] = 100
+        with patch("hardware.time.monotonic", return_value=10):
+            control = PositionController(self.config, self.cal, self.cal, [2000] * 6)
+            control.target(self.sample(1, [2000] * 6), [2000] * 6)
+        targets = []
+        for n in range(1, 61):
+            with patch("hardware.time.monotonic", return_value=10 + n / 60):
+                targets.append(control.target(self.sample(n + 1, [3000] * 6), [2000] * 6)[0])
+        self.assertGreater(targets[2], 2001)
+        self.assertEqual(targets[-1], 2010)
+        self.assertTrue(all(a <= b <= a + 2 for a, b in zip([2000] + targets, targets)))
+        with patch("hardware.time.monotonic", return_value=11.02):
+            with self.assertRaisesRegex(RuntimeError, "tracking error"):
+                control.target(self.sample(62, [3000] * 6), [1980] * 6)
 
     def test_stale_reordered_and_out_of_range_samples_fail(self):
         control = PositionController(self.config, self.cal, self.cal, [2000] * 6)
@@ -93,7 +109,8 @@ class ControllerTests(unittest.TestCase):
             if register == 40:
                 torque[motor] = value
         bus.read, bus.write = read, write
-        bus.driver = SimpleNamespace(sync_read=lambda *_args, **_kwargs: dict.fromkeys(JOINTS, 2000))
+        bus.positions = lambda: [2000] * 6
+        bus.require_passive = lambda: self.assertTrue(all(value == 0 for value in torque.values()))
         bus.send_positions = lambda positions: [write(m, 42, p, 2) for m, p in zip(bus.ids, positions)]
         bus.close = lambda: closed.append(True)
         cal = [{"id": i + 1, "range_min": 0, "range_max": 4095, "homing_offset": 0,

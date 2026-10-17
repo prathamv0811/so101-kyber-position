@@ -82,6 +82,8 @@ def wait_video(paths, children, timeout=20):
 
 def follower(args, children, runtime):
     config = json.loads(local(args.config).read_text())
+    if args.listen_host:
+        config["listen"] = args.listen_host
     credentials = local(config.get("credentials", "credentials/server"))
     network = ["--insecure-lan"] if args.insecure_lan else []
     for name in (() if args.insecure_lan else ("ca.crt", "cert.pem", "key.pem")):
@@ -124,7 +126,7 @@ def follower(args, children, runtime):
         return None
     address = f"{config['listen']}:{config.get('command_port', 7445)}"
     receive = [BIN, "receive", "--listen", address, "--credentials", credentials,
-        "--output", runtime / "positions.jsonl"] + network
+        "--output", runtime / "positions.jsonl", "--hz", args.hz] + network
     receiver = children.start("commands", receive, pipe=not args.simulate)
     if not args.simulate:
         command = [sys.executable, ROOT / "hardware.py", "drive", "--port", config["port"],
@@ -134,7 +136,7 @@ def follower(args, children, runtime):
             command += ["--video-status", path]
         children.start("motors", command, stdin=receiver.stdout)
         receiver.stdout.close()
-    print(f"Command receiver: {address}; log directory: {runtime}", flush=True)
+    print(f"Command receiver: {address}; {args.hz} Hz; log directory: {runtime}", flush=True)
     return receiver
 
 
@@ -164,7 +166,7 @@ def operator(args, children, runtime):
     print("Both video streams are receiving frames", flush=True)
     if args.preview_only:
         return None, statuses
-    command = [BIN, "publish", "--remote", f"{args.host}:{args.command_port}", "--credentials", credentials] + network
+    command = [BIN, "publish", "--remote", f"{args.host}:{args.command_port}", "--credentials", credentials, "--hz", args.hz] + network
     if args.seconds:
         command += ["--seconds", str(args.seconds)]
     source = None
@@ -172,7 +174,7 @@ def operator(args, children, runtime):
         command += ["--simulate"]
     else:
         source = children.start("leader", [sys.executable, ROOT / "hardware.py", "leader",
-            "--port", args.port, "--calibration", local(args.calibration)], pipe=True)
+            "--port", args.port, "--calibration", local(args.calibration), "--hz", args.hz], pipe=True)
     publisher = children.start("publisher", command, stdin=source.stdout if source else None)
     if source:
         source.stdout.close()
@@ -184,6 +186,7 @@ def main():
     roles = parser.add_subparsers(dest="role", required=True)
     server = roles.add_parser("follower")
     server.add_argument("--config", default="config/follower.launch.local.json")
+    server.add_argument("--listen-host", help="Override profile bind address (e.g. this laptop Tailscale IP)")
     server.add_argument("--attended", action="store_true")
     server.add_argument("--enable-motion", action="store_true")
     client = roles.add_parser("operator")
@@ -197,14 +200,17 @@ def main():
     client.add_argument("--headless", action="store_true", help="Decode without windows for tests")
     client.add_argument("--seconds", type=float)
     for role in (server, client):
-        role.add_argument("--insecure-lan", action="store_true", help="Private LAN only; no credentials or peer identity verification")
+        role.add_argument("--hz", type=int, choices=range(10, 121), default=60, metavar="10..120",
+                          help="Command/leader rate (default: 60); video stays at 30 fps")
+        role.add_argument("--insecure-lan", "--tailscale", dest="insecure_lan", action="store_true",
+                          help="Private LAN/Tailscale; no application credentials or peer identity verification")
         role.add_argument("--preview-only", action="store_true")
         role.add_argument("--simulate", action="store_true", help="Synthetic devices; never opens motors")
     args = parser.parse_args()
     if args.preview_only and args.simulate:
         parser.error("Choose --preview-only or --simulate")
     if args.insecure_lan:
-        print("LAN mode: encrypted but no peer identity verification; use a trusted private Wi-Fi network", flush=True)
+        print("Private network mode: encrypted; application peer identity unchecked; restrict access with trusted LAN/Tailscale policy", flush=True)
     runtime = ROOT / "recordings" / (time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6])
     runtime.mkdir(parents=True, mode=0o700)
     children = Children(runtime)
