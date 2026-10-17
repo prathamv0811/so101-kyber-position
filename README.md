@@ -3,7 +3,7 @@
 LeRobot supplies SO-101 control and calibration. Kyber supplies the client/server
 transport for native motor actions and two GStreamer video feeds. The leader is
 on the MacBook; the follower, Logitech top camera, and Sonix wrist camera are on
-the Ubuntu laptop. Control defaults to **60 Hz**, video to **30 fps**.
+the Ubuntu laptop. Control defaults to **120 Hz**, video to **30 fps**.
 
 ```text
 Mac: SO101Leader.get_action()
@@ -11,7 +11,7 @@ Mac: SO101Leader.get_action()
   → Tailscale or private LAN
   → Kyber server → SO101Follower.send_action() → follower motors
 
-Follower cameras → GStreamer H.264 → KyProto GOP video → Mac video windows
+Follower cameras → GStreamer H.264 → KyProto datagram video → Mac video windows
 ```
 
 The six action keys are `shoulder_pan.pos`, `shoulder_lift.pos`, `elbow_flex.pos`,
@@ -42,7 +42,7 @@ It builds the official `kynet`, `kyproto`, and `kymux-types` libraries directly.
 
 The current application does not use `kynput` gamepad emulation for robot
 commands: kynput has no native SO-101 action payload. Native LeRobot actions use
-Kyber's KyNet transport. Video uses the official KyProto GOP stream, not a custom
+Kyber's KyNet transport. Video uses the official KyProto datagram stream, not a custom
 video socket or LeRobot camera transport. The full Kyber desktop app and
 `kyavservice` executable are not required.
 
@@ -88,13 +88,13 @@ On the follower laptop, with the supported arm attended at its power cutoff:
 ```bash
 source scripts/build-env.sh
 .venv/bin/python session.py follower --listen-host 100.79.3.30 \
-  --tailscale --hz 60 --attended --enable-motion
+  --tailscale --hz 120 --attended --enable-motion
 ```
 
 On the Mac, replace the USB path:
 
 ```bash
-.venv/bin/python session.py operator --host 100.79.3.30 --tailscale --hz 60 \
+.venv/bin/python session.py operator --host 100.79.3.30 --tailscale --hz 120 \
   --port /dev/cu.usbmodemYOUR_DEVICE --calibration calibration/leader.json
 ```
 
@@ -104,7 +104,7 @@ pose, enables torque explicitly, and approaches the absolute leader pose at the
 configured speed. `SO101Follower.send_action()` performs the motor writes and
 applies LeRobot's `max_relative_target` guard. A freshness/limits wrapper uses
 LeRobot's `ensure_safe_goal_position` to preserve the reviewed per-second speed
-limits, including sub-tick progress at 60 Hz.
+limits, including sub-tick progress at 120 Hz.
 
 UDP ports are **7445** for actions, **7446** for top video, and **7447** for wrist
 video. `--tailscale` requires no application credential files: access relies on
@@ -130,7 +130,7 @@ Private run directories under `recordings/` contain `motors.log`, camera/network
 logs, and `actions.jsonl`. Motor logs report actual update rate, input action,
 measured observation, and target once per second. Journals contain received
 leader actions, not measured follower telemetry or proof of execution. Actual
-rate depends on Wi-Fi/Tailscale, USB, and scheduling; 60 Hz is the requested rate.
+rate depends on Wi-Fi/Tailscale, USB, and scheduling; 120 Hz is the requested rate.
 
 ```bash
 source scripts/build-env.sh
@@ -142,7 +142,7 @@ cargo test --locked
 .venv/bin/python scripts/test-session.py --insecure-lan
 ```
 
-Tests cover native units, exact action transport, absolute pose behavior, 60 Hz
+Tests cover native units, exact action transport, absolute pose behavior, 120 Hz
 sampling, source freshness, authentication, connection-loss stop, camera-loss
 stop, both video feeds, and real LeRobot methods with only hardware I/O mocked.
 Physical movement/stop performance and the Mac-to-laptop route still need local
@@ -171,3 +171,17 @@ Camera setup errors now name the failed stage. Failed initial camera setup
 leaves its listener waiting for a new explicit client attempt; established video
 or motor sessions still stop on failure. The Mac launcher prints the failing
 child process’s log tail in Terminal.
+
+The video path now uses KyProto `VideoProtocol::Unreliable`: codec/config packets
+remain reliable, while H.264 media uses QUIC datagrams with bounded send queues.
+A new video ALPN requires updating both machines. Capture drops frames older than
+100 ms, keyframes repeat every 200 ms, and the viewer drops added queue delay over
+100 ms relative to its fastest observed arrival. This works without matching
+computer clocks; it is not an absolute capture-to-display latency measurement.
+After a packet gap the viewer waits for a fresh keyframe. The decoder uses one
+thread and the display queue keeps one decoded frame, with display sync disabled.
+Each camera is 640×480 at 30 fps, initially 1200 kbit/s. Actual latency still
+depends on exposure, USB, the network, decoding, and display hardware.
+
+The existing motion bounds, speed limits, and tracking checks remain active.
+Only the command sampling target has increased to 120 Hz.

@@ -72,7 +72,7 @@ enum Command {
         #[arg(long)]
         output: PathBuf,
         /// Maximum command challenge rate; follower updates follow accepted samples.
-        #[arg(long, default_value_t = 60)]
+        #[arg(long, default_value_t = 120)]
         hz: u32,
     },
     /// Publish NDJSON samples from stdin, or generate a hardware-free signal.
@@ -90,7 +90,7 @@ enum Command {
         simulate: bool,
         #[arg(long)]
         seconds: Option<f64>,
-        #[arg(long, default_value_t = 60)]
+        #[arg(long, default_value_t = 120)]
         hz: u32,
     },
 }
@@ -385,7 +385,11 @@ async fn publish(
         tokio::time::timeout(DEADLINE, send.write_all(&stop)).await??;
         tokio::time::timeout(Duration::from_secs(1), conn.closed()).await??;
     }
-    conn.close(0, "Publisher stopped");
+    if let Err(error) = &outcome {
+        conn.close(1, &format!("Publisher failed: {error}"));
+    } else {
+        conn.close(0, "Publisher stopped");
+    }
     endpoint.wait_idle().await;
     eprintln!("Published {seq} position samples");
     outcome

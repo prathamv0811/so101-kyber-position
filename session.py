@@ -156,10 +156,11 @@ def operator(args, children, runtime):
         statuses.append(status)
         viewer = children.start(f"{name}-viewer", [BIN, "camera-view", "--remote", f"{args.host}:{port}",
             "--credentials", credentials, "--status-file", status] + network, pipe=True)
-        display = ["gst-launch-1.0", "-q", "fdsrc", "!", "h264parse", "!", "avdec_h264", "!",
+        display = ["gst-launch-1.0", "-q", "fdsrc", "!", "h264parse", "!", "avdec_h264", "max-threads=1", "output-corrupt=false", "!",
             "fakesink" if args.headless else "videoconvert"]
         if not args.headless:
-            display += ["!", "autovideosink", f"name={name}", "sync=false"]
+            display += ["!", "queue", "max-size-buffers=1", "max-size-bytes=0", "max-size-time=0", "leaky=downstream",
+                        "!", "autovideosink", f"name={name}", "sync=false"]
         children.start(f"{name}-display", display, stdin=viewer.stdout)
         viewer.stdout.close()
     print("Waiting for both top and wrist video", flush=True)
@@ -202,8 +203,8 @@ def main():
     client.add_argument("--headless", action="store_true", help="Decode without windows for tests")
     client.add_argument("--seconds", type=float)
     for role in (server, client):
-        role.add_argument("--hz", type=int, choices=range(10, 121), default=60, metavar="10..120",
-                          help="Command/leader rate (default: 60); video stays at 30 fps")
+        role.add_argument("--hz", type=int, choices=range(10, 121), default=120, metavar="10..120",
+                          help="Command/leader rate (default: 120); video stays at 30 fps")
         role.add_argument("--insecure-lan", "--tailscale", dest="insecure_lan", action="store_true",
                           help="Private LAN/Tailscale; no application credentials or peer identity verification")
         role.add_argument("--preview-only", action="store_true")

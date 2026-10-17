@@ -19,13 +19,12 @@ def main():
         # Encode the property with GStreamer's own quoting rules via JSON string syntax.
         import json
         source = "v4l2src device=" + json.dumps(args.device)
-    pipeline = Gst.parse_launch(source + " ! videoconvert ! videoscale ! videorate ! "
+    pipeline = Gst.parse_launch(source + " ! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream ! videoconvert ! videoscale ! videorate ! "
         "video/x-raw,format=I420,width=640,height=480,framerate=30/1 ! "
-        "queue max-size-buffers=1 leaky=downstream ! "
-        "x264enc tune=zerolatency speed-preset=ultrafast bitrate=2500 "
-        "key-int-max=15 bframes=0 byte-stream=true ! h264parse config-interval=-1 ! "
+        "x264enc tune=zerolatency speed-preset=ultrafast bitrate=1200 vbv-buf-capacity=100 "
+        "key-int-max=6 bframes=0 rc-lookahead=0 sync-lookahead=0 byte-stream=true ! h264parse config-interval=-1 ! "
         "video/x-h264,stream-format=byte-stream,alignment=au ! "
-        "appsink name=frames sync=false max-buffers=1 drop=false")
+        "appsink name=frames sync=false max-buffers=1 drop=true")
     sink = pipeline.get_by_name("frames")
     bus = pipeline.get_bus()
     pipeline.set_state(Gst.State.PLAYING)
@@ -52,7 +51,7 @@ def main():
                 if frame_running == Gst.CLOCK_TIME_NONE:
                     raise RuntimeError("Cannot map camera timestamp to running time")
                 age = max(0, running - frame_running)
-                if age > 250_000_000:
+                if age > 100_000_000:
                     continue
                 is_key = not buffer.has_flags(Gst.BufferFlags.DELTA_UNIT)
                 sys.stdout.buffer.write(struct.pack("!IQB", len(data), time.time_ns() - age, is_key))

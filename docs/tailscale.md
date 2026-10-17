@@ -27,7 +27,7 @@ In the existing Mac project checkout, stop the old operator with Ctrl+C, then:
 git pull
 python3 scripts/setup.py
 .venv/bin/python session.py operator \
-  --host 100.79.3.30 --tailscale --hz 60 \
+  --host 100.79.3.30 --tailscale --hz 120 \
   --port /dev/cu.usbmodemYOUR_DEVICE \
   --calibration calibration/leader.json
 ```
@@ -44,7 +44,7 @@ With the follower supported and attended at its power cutoff:
 ```bash
 source scripts/build-env.sh
 .venv/bin/python session.py follower --listen-host 100.79.3.30 \
-  --tailscale --hz 60 --attended --enable-motion
+  --tailscale --hz 120 --attended --enable-motion
 ```
 
 The local profile supplies the follower USB path, matching `follower_2`

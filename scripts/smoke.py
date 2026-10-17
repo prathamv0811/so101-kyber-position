@@ -90,6 +90,7 @@ def main():
             assert client.returncode != 0
             server.wait(3)
             assert output.stat().st_size == 0
+            assert "Publisher failed: Leader sample older than 100 ms" in (root / "stale.log").read_text()
 
             address, server, output = receiver("watchdog")
             client = start("watchdog-client", [BIN, "publish", "--remote", address,
@@ -145,7 +146,7 @@ def main():
                 "publisher_loss_watchdog": True, "untrusted_peer_rejected": True,
                 "delayed_lerobot_startup": True,
                 "gstreamer_video_frames": frame_count, "gstreamer_decode": True,
-                "video_transport": "KyProto GopStream H.264",
+                "video_transport": "KyProto Unreliable H.264",
                 "concurrent_control_samples": concurrent_samples,
                 "hardware_opened": False}, indent=2))
         except Exception:

@@ -14,7 +14,7 @@ follower.send_action(native_action)
 
 Kyber supplies the network boundary; LeRobot supplies `SO101Leader`,
 `SO101Follower`, their calibration files, motor normalization, safe-goal helper,
-and motor writes. Video uses GStreamer H.264 and Kyber's KyProto GOP stream.
+and motor writes. Video uses GStreamer H.264 and Kyber's KyProto datagram stream.
 There is no LeRobot camera/network transport in the remote path.
 
 Both arms use `use_degrees=True`: body actions are degrees and the gripper is
@@ -48,5 +48,5 @@ shared by both. The local checkout is not modified or silently substituted.
 Tests exercise actual LeRobot get/send methods with physical I/O mocked and
 verify signed fractional values across real Kyber QUIC connections.
 
-Control requests default to 60 Hz on reader, client, and server. Video stays
+Control requests default to 120 Hz on reader, client, and server. Video stays
 30 fps. Logs report actual follower update rate. See [remote setup](tailscale.md).

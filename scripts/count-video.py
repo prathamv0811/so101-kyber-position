@@ -5,7 +5,7 @@ gi.require_version("Gst", "1.0")
 from gi.repository import Gst
 
 Gst.init(None)
-pipeline = Gst.parse_launch("filesrc name=source ! h264parse ! avdec_h264 ! fakesink name=sink signal-handoffs=true")
+pipeline = Gst.parse_launch("filesrc name=source ! h264parse ! avdec_h264 max-threads=1 ! fakesink name=sink signal-handoffs=true")
 pipeline.get_by_name("source").set_property("location", sys.argv[1])
 count = [0]
 pipeline.get_by_name("sink").connect("handoff", lambda *_: count.__setitem__(0, count[0] + 1))

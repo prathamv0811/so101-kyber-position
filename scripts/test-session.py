@@ -12,6 +12,8 @@ INSECURE = "--insecure-lan" in sys.argv or "--tailscale" in sys.argv
 HOST = os.environ.get("SESSION_TEST_HOST", "127.0.0.1")
 NETWORK = ["--insecure-lan"] if INSECURE else []
 
+RATE = int(os.environ.get("SESSION_TEST_HZ", "120"))
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -32,7 +34,7 @@ with tempfile.TemporaryDirectory(prefix="so101-dual-video-") as directory:
         "command_port": command, "cameras": {"top": {"port": top}, "wrist": {"port": wrist}}}))
     before = set((ROOT / "recordings").glob("*"))
     log = (temporary / "follower.log").open("w")
-    follower = subprocess.Popen([sys.executable, "session.py", "follower", "--config", str(config), "--simulate", "--hz", "60"] + NETWORK,
+    follower = subprocess.Popen([sys.executable, "session.py", "follower", "--config", str(config), "--simulate", "--hz", str(RATE)] + NETWORK,
         cwd=ROOT, stdout=log, stderr=log)
     try:
         deadline = time.monotonic() + 5
@@ -43,7 +45,7 @@ with tempfile.TemporaryDirectory(prefix="so101-dual-video-") as directory:
         time.sleep(0.2)
         operator = subprocess.run([sys.executable, "session.py", "operator", "--host", HOST,
             "--credentials", str(credentials / "leader"), "--top-port", str(top), "--wrist-port", str(wrist),
-            "--command-port", str(command), "--simulate", "--headless", "--seconds", "2", "--hz", "60"] + NETWORK,
+            "--command-port", str(command), "--simulate", "--headless", "--seconds", "2", "--hz", str(RATE)] + NETWORK,
             cwd=ROOT, capture_output=True, text=True, timeout=20)
         assert operator.returncode == 0, operator.stdout + operator.stderr
         assert follower.wait(8) == 0, (temporary / "follower.log").read_text()
@@ -66,7 +68,7 @@ with tempfile.TemporaryDirectory(prefix="so101-dual-video-") as directory:
                 samples += len(records)
                 seconds = (records[-1]["received_unix_ns"] - records[0]["received_unix_ns"]) / 1e9
                 measured_hz = (len(records) - 1) / seconds
-                assert 55 <= measured_hz <= 65, measured_hz
+                assert RATE * .9 <= measured_hz <= RATE * 1.1, measured_hz
         assert samples >= 30, samples
         assert len(videos) == 4, videos
         print(json.dumps({"passed": True, "top_and_wrist_decoded": True,

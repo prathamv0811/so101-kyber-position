@@ -361,7 +361,7 @@ def main():
     read = commands.add_parser("leader", help="Read native LeRobot SO-101 actions from a passive leader")
     read.add_argument("--port", required=True)
     read.add_argument("--calibration", required=True)
-    read.add_argument("--hz", type=int, choices=range(10, 121), default=60, metavar="10..120")
+    read.add_argument("--hz", type=int, choices=range(10, 121), default=120, metavar="10..120")
     follow = commands.add_parser("drive", help="Apply native LeRobot actions from the Kyber server")
     follow.add_argument("--port", required=True)
     follow.add_argument("--config", required=True)

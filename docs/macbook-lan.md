@@ -62,7 +62,7 @@ With the follower supported and an attendant at its power cutoff:
 ```bash
 cd /home/dev/so101-kyber-position
 source scripts/build-env.sh
-.venv/bin/python session.py follower --insecure-lan --hz 60 --attended --enable-motion
+.venv/bin/python session.py follower --insecure-lan --hz 120 --attended --enable-motion
 ```
 
 This starts both camera streams and the command receiver. The follower waits
@@ -80,7 +80,7 @@ In the Mac checkout, replace the USB placeholder:
 
 ```bash
 .venv/bin/python session.py operator \
-  --host 192.168.101.50 --insecure-lan --hz 60 \
+  --host 192.168.101.50 --insecure-lan --hz 120 \
   --port /dev/cu.usbmodemYOUR_DEVICE \
   --calibration calibration/leader.json
 ```
@@ -122,9 +122,9 @@ If connection fails, check the laptop's current address (`ip -brief -4 address`)
 Wi-Fi client isolation, firewall UDP rules for 7445–7447, and the latest run logs.
 The software does not change firewall settings or require router port forwarding.
 
-Control defaults to **60 Hz** on both roles (`--hz 60`). The Mac passes this to
+Control defaults to **120 Hz** on both roles (`--hz 120`). The Mac passes this to
 both the LeRobot leader reader and network publisher; the listener paces
-challenges at 60 Hz and the follower updates on each accepted sample. Video
+challenges at 120 Hz and the follower updates on each accepted sample. Video
 remains 30 fps. Actual throughput depends on USB, Wi-Fi, and scheduling. The
 motor log reports measured update rate, leader values, feedback, and targets
 once per second. Speed limits remain in ticks/second, independent of sample rate.
