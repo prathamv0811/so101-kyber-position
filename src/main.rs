@@ -1,10 +1,10 @@
 mod media;
 mod tls;
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
-use kynput::{GamepadAxis, GamepadEvent, InputPacket, InputTarget, InputType, Payload};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeMap,
     fs::OpenOptions,
     io::Write,
     net::SocketAddr,
@@ -14,20 +14,20 @@ use std::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-const ALPN: &[u8] = b"so101-kynput-position-v2";
-const FRAME_LEN: usize = 24 + 6 * 9;
+const ALPN: &[u8] = b"so101-lerobot-action-v3";
+const FRAME_LEN: usize = 24 + 6 * 8;
 const DEADLINE: Duration = Duration::from_millis(200);
-const AXES: [GamepadAxis; 6] = [
-    GamepadAxis::LeftX,
-    GamepadAxis::LeftY,
-    GamepadAxis::RightX,
-    GamepadAxis::RightY,
-    GamepadAxis::TriggerLeft,
-    GamepadAxis::TriggerRight,
+const JOINTS: [&str; 6] = [
+    "shoulder_pan.pos",
+    "shoulder_lift.pos",
+    "elbow_flex.pos",
+    "wrist_flex.pos",
+    "wrist_roll.pos",
+    "gripper.pos",
 ];
 
 #[derive(Parser)]
-#[command(about = "SO-101 position samples carried by kynput over authenticated KyNet QUIC")]
+#[command(about = "Native LeRobot SO-101 actions over Kyber KyNet QUIC")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -99,7 +99,7 @@ enum Command {
 #[serde(deny_unknown_fields)]
 struct Sample {
     captured_unix_ns: u64,
-    positions: [u16; 6],
+    action: BTreeMap<String, f64>,
 }
 
 fn now_ns() -> u64 {
@@ -109,30 +109,35 @@ fn now_ns() -> u64 {
         .as_nanos() as u64
 }
 
-fn encode(challenge: u64, seq: u64, sample: &Sample) -> Result<Vec<u8>> {
+fn validate_action(action: &BTreeMap<String, f64>) -> Result<()> {
     ensure!(
-        sample.positions.iter().all(|&x| x <= 4095),
-        "Position outside 0..4095"
+        action.len() == JOINTS.len(),
+        "Exactly six LeRobot .pos keys required"
     );
+    for (index, name) in JOINTS.iter().enumerate() {
+        let value = *action.get(*name).context("Missing LeRobot joint")?;
+        let valid = if index == 5 {
+            (0.0..=100.0).contains(&value)
+        } else {
+            (-360.0..=360.0).contains(&value)
+        };
+        ensure!(
+            value.is_finite() && valid,
+            "Invalid LeRobot joint value: {name}"
+        );
+    }
+    Ok(())
+}
+
+fn encode(challenge: u64, seq: u64, sample: &Sample) -> Result<Vec<u8>> {
+    validate_action(&sample.action)?;
     let mut buf = Vec::with_capacity(FRAME_LEN);
     buf.extend(challenge.to_be_bytes());
     buf.extend(seq.to_be_bytes());
     buf.extend(sample.captured_unix_ns.to_be_bytes());
-    for (axis, &position) in AXES.iter().zip(&sample.positions) {
-        // Project-specific virtual six-axis controller. Values preserve calibrated 12-bit fractions exactly.
-        // These packets are consumed by our receiver, never injected into an OS gamepad.
-        let packet = InputPacket::new(
-            InputTarget::Host,
-            Payload::GamepadEvent(GamepadEvent::Axis {
-                id: 101,
-                type_: *axis,
-                value: position as i16,
-            }),
-        );
-        buf.push(packet.get_type() as u8);
-        buf.extend(packet.serialize());
+    for name in JOINTS {
+        buf.extend(sample.action[name].to_be_bytes());
     }
-    ensure!(buf.len() == FRAME_LEN, "Unexpected kynput packet layout");
     Ok(buf)
 }
 
@@ -142,32 +147,22 @@ fn decode(buf: &[u8], challenge: u64, previous: u64) -> Result<(u64, Sample)> {
     ensure!(number(0) == challenge, "Expired challenge");
     let seq = number(8);
     ensure!(seq > previous, "Duplicate or reordered sample");
-    let mut positions = [0u16; 6];
-    for (i, chunk) in buf[24..].chunks_exact(9).enumerate() {
-        // Validate lengths/discriminants before calling upstream deserializers, which
-        // assume well-formed buffers and can panic on malformed input.
-        ensure!(
-            chunk[0] == InputType::GamepadEvent as u8
-                && chunk[1] == 1
-                && chunk[2..6] == 101u32.to_be_bytes()
-                && chunk[6] == AXES[i] as u8,
-            "Invalid joint event/order"
-        );
-        let packet = InputPacket::deserialize(chunk[0], InputTarget::Host, &chunk[1..])?;
-        match packet.payload {
-            Payload::GamepadEvent(GamepadEvent::Axis { value, .. })
-                if (0..=4095).contains(&value) =>
-            {
-                positions[i] = value as u16;
-            }
-            _ => bail!("Invalid position event"),
-        }
-    }
+    let action = JOINTS
+        .iter()
+        .zip(buf[24..].chunks_exact(8))
+        .map(|(name, chunk)| {
+            (
+                name.to_string(),
+                f64::from_be_bytes(chunk.try_into().unwrap()),
+            )
+        })
+        .collect();
+    validate_action(&action)?;
     Ok((
         seq,
         Sample {
             captured_unix_ns: number(16),
-            positions,
+            action,
         },
     ))
 }
@@ -242,9 +237,9 @@ async fn receive(
                 break Ok(());
             }
             let (new_seq, sample) = decode(&frame, challenge, seq)?;
-            let record = serde_json::json!({"version":2,"units":"calibrated_fraction_12bit","seq":new_seq,
+            let record = serde_json::json!({"version":3,"units":"lerobot_degrees_gripper_percent","seq":new_seq,
                 "captured_unix_ns":sample.captured_unix_ns,"received_unix_ns":now_ns(),
-                "positions":sample.positions,"challenge_round_trip_ms":issued.elapsed().as_secs_f64()*1000.0});
+                "action":sample.action,"challenge_round_trip_ms":issued.elapsed().as_secs_f64()*1000.0});
             let line = serde_json::to_string(&record)?;
             writeln!(journal, "{line}")?;
             journal.flush()?;
@@ -296,10 +291,7 @@ async fn publish(
                         "Oversized/unterminated sample"
                     );
                     let sample: Sample = serde_json::from_slice(&line)?;
-                    ensure!(
-                        sample.positions.iter().all(|&x| x <= 4095),
-                        "Invalid calibrated fraction"
-                    );
+                    validate_action(&sample.action)?;
                     source_tx.send_replace(Some(sample));
                 }
                 Ok(())
@@ -351,9 +343,18 @@ async fn publish(
                 let t = start.elapsed().as_secs_f64();
                 Sample {
                     captured_unix_ns: now_ns(),
-                    positions: std::array::from_fn(|i| {
-                        (2048.0 + 300.0 * (t + i as f64 / 4.0).sin()) as u16
-                    }),
+                    action: JOINTS
+                        .iter()
+                        .enumerate()
+                        .map(|(i, name)| {
+                            let value = if i == 5 {
+                                50.0 + 20.0 * t.sin()
+                            } else {
+                                30.0 * (t + i as f64 / 4.0).sin()
+                            };
+                            (name.to_string(), value)
+                        })
+                        .collect(),
                 }
             } else {
                 if source_rx.borrow().is_none() {
@@ -452,22 +453,31 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     #[test]
-    fn exact_ticks_and_atomic_order() {
+    fn native_actions_preserve_signed_fractional_units_and_order() {
         let sample = Sample {
             captured_unix_ns: 123,
-            positions: [0, 4095, 2048, 1, 200, 3000],
+            action: JOINTS
+                .iter()
+                .zip([-150.125, 90.5, 0.0, -0.001, 180.0, 66.625])
+                .map(|(name, value)| (name.to_string(), value))
+                .collect(),
         };
         let frame = encode(4, 8, &sample).unwrap();
         let (seq, decoded) = decode(&frame, 4, 7).unwrap();
         assert_eq!(seq, 8);
-        assert_eq!(decoded.positions, sample.positions);
+        assert_eq!(decoded.action, sample.action);
         assert!(decode(&frame, 4, 8).is_err());
         assert!(decode(&frame, 5, 7).is_err());
         for length in 0..FRAME_LEN {
             assert!(decode(&frame[..length], 4, 7).is_err());
         }
         let mut corrupt = frame;
-        corrupt[30] = 255;
+        corrupt[24..32].copy_from_slice(&f64::NAN.to_be_bytes());
         assert!(decode(&corrupt, 4, 7).is_err());
+        let mut invalid = sample.clone();
+        invalid.action.insert("gripper.pos".into(), 101.0);
+        assert!(encode(4, 8, &invalid).is_err());
+        invalid.action.remove("gripper.pos");
+        assert!(encode(4, 8, &invalid).is_err());
     }
 }

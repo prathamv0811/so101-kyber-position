@@ -10,6 +10,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 BIN = ROOT / "target/debug/so101-kyber-position"
+JOINTS = ("shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper")
+ACTION = {f"{name}.pos": 50.0 if name == "gripper" else -10.125 for name in JOINTS}
 
 
 def port():
@@ -53,7 +55,7 @@ def main():
             records = [json.loads(line) for line in output.read_text().splitlines()]
             assert len(records) >= 40, len(records)
             assert [r["seq"] for r in records] == list(range(1, len(records) + 1))
-            assert all(len(r["positions"]) == 6 and all(0 <= p <= 4095 for p in r["positions"]) for r in records)
+            assert all(r["version"] == 3 and len(r["action"]) == 6 for r in records)
 
             # Model delayed LeRobot imports/USB initialization before its first sample.
             address, server, output = receiver("slow-source")
@@ -63,7 +65,7 @@ def main():
             assert client.poll() is None
             deadline = time.monotonic() + 2
             while client.poll() is None and time.monotonic() < deadline:
-                sample = {"captured_unix_ns": time.time_ns(), "positions": [2048] * 6}
+                sample = {"captured_unix_ns": time.time_ns(), "action": ACTION}
                 try:
                     client.stdin.write((json.dumps(sample) + "\n").encode())
                     client.stdin.flush()
@@ -76,12 +78,14 @@ def main():
             except BrokenPipeError:
                 pass
             assert server.wait(3) == 0
-            assert len(output.read_text().splitlines()) >= 15
+            slow_records = [json.loads(line) for line in output.read_text().splitlines()]
+            assert len(slow_records) >= 15
+            assert all(record["action"] == ACTION for record in slow_records), "Native action values changed in transport"
 
             address, server, output = receiver("stale")
             client = start("stale-client", [BIN, "publish", "--remote", address,
                 "--credentials", creds / "leader"], stdin=subprocess.PIPE)
-            sample = {"captured_unix_ns": time.time_ns() - 1_000_000_000, "positions": [2048] * 6}
+            sample = {"captured_unix_ns": time.time_ns() - 1_000_000_000, "action": ACTION}
             client.communicate((json.dumps(sample) + "\n").encode(), timeout=5)
             assert client.returncode != 0
             server.wait(3)

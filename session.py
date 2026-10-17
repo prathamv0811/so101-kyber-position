@@ -10,7 +10,7 @@ import time
 import uuid
 from pathlib import Path
 
-from hardware import JOINTS, PositionController, calibration, require_video
+from hardware import JOINTS, LeRobotControls, calibration, require_video, ticks_to_action
 
 ROOT = Path(__file__).resolve().parent
 BIN = ROOT / "target/debug/so101-kyber-position"
@@ -98,11 +98,10 @@ def follower(args, children, runtime):
     if not args.preview_only and not args.simulate:
         if not (args.attended and args.enable_motion):
             raise ValueError("Motor operation requires --attended --enable-motion")
-        lc = [{"range_min": 0, "range_max": 4095} for _ in JOINTS]
         fc = calibration(local(config["follower_calibration"]))
         limits = json.loads(local(config["limits"]).read_text())
         pose = [(limits["joints"][j]["min_ticks"] + limits["joints"][j]["max_ticks"]) // 2 for j in JOINTS]
-        PositionController(limits, lc, fc, pose)
+        LeRobotControls(limits, fc, ticks_to_action(pose, fc))
         if not Path(config["port"]).exists():
             raise ValueError("Configured follower serial path is not present")
     statuses = []
@@ -126,7 +125,7 @@ def follower(args, children, runtime):
         return None
     address = f"{config['listen']}:{config.get('command_port', 7445)}"
     receive = [BIN, "receive", "--listen", address, "--credentials", credentials,
-        "--output", runtime / "positions.jsonl", "--hz", args.hz] + network
+        "--output", runtime / "actions.jsonl", "--hz", args.hz] + network
     receiver = children.start("commands", receive, pipe=not args.simulate)
     if not args.simulate:
         command = [sys.executable, ROOT / "hardware.py", "drive", "--port", config["port"],

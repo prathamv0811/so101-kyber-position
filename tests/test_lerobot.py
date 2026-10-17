@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from hardware import Bus, JOINTS
+from hardware import Bus, JOINTS, ticks_to_action
 
 
 class LeRobotAdapterTests(unittest.TestCase):
@@ -34,25 +34,29 @@ class LeRobotAdapterTests(unittest.TestCase):
                     normalized = bus.driver._normalize(dict(zip(bus.ids, raw)))
                     reading = {name: normalized[i] for name, i in zip(JOINTS, bus.ids)}
                     with patch.object(bus.driver, "sync_read", return_value=reading) as read:
-                        self.assertEqual(bus.positions(), raw)
+                        expected = {f"{name}.pos": reading[name] for name in JOINTS}
+                        action = bus.get_action() if role == "leader" else bus.get_observation()
+                        self.assertEqual(action, expected)
                         read.assert_called_once_with("Present_Position", num_retry=2)
+                        self.assertEqual(ticks_to_action(raw, bus.cal), expected)
                     # Exercise actual SOFollower.send_action, not a replacement stub.
                     with patch.object(bus.driver, "sync_write") as write:
                         if role == "follower":
-                            sent = bus.send_positions(raw)
+                            sent = bus.send_action(expected)
                             write.assert_called_once_with("Goal_Position", reading)
                             self.assertEqual(set(sent), {f"{name}.pos" for name in JOINTS})
                             decoded = bus.driver._unnormalize(normalized)
                             self.assertTrue(all(abs(decoded[i] - value) <= 1 for i, value in zip(bus.ids, raw)))
                         else:
                             with self.assertRaisesRegex(RuntimeError, "Only the follower"):
-                                bus.send_positions(raw)
+                                bus.send_action(expected)
                             write.assert_not_called()
                     # Saturation must not hide gripper register values beyond calibration.
                     reading["gripper"] = 100.0
                     with patch.object(bus.driver, "sync_read", return_value=reading), \
                          patch.object(bus.driver, "read", return_value=data["gripper"]["range_max"] + 10):
-                        self.assertEqual(bus.positions()[-1], data["gripper"]["range_max"] + 10)
+                        with self.assertRaisesRegex(RuntimeError, "calibrated range"):
+                            bus.get_action() if role == "leader" else bus.get_observation()
                     with patch.object(bus.driver, "disconnect") as disconnect:
                         bus.close()
                         disconnect.assert_called_once_with(disable_torque=False)

@@ -67,8 +67,8 @@ source scripts/build-env.sh
 
 This starts both camera streams and the command receiver. The follower waits
 with torque off for up to one hour. Fresh leader input and both camera streams
-are required before torque is enabled. The first input anchors movement to the
-follower's current pose; subsequent commands are relative and bounded by limits.
+are required before torque is enabled. The follower approaches the leader's absolute LeRobot joint pose under reviewed
+bounds and speed limits; no relative startup anchor is applied.
 
 For video only, use `--preview-only` instead of the two motor flags. Start a
 matching `--preview-only` operator. For a fully synthetic test on both sides,
@@ -86,15 +86,15 @@ In the Mac checkout, replace the USB placeholder:
 ```
 
 Two windows show the top and wrist cameras. Only after both receive video does
-the Mac begin publishing leader positions. Ctrl+C ends the session. Command
+the Mac begin publishing native LeRobot actions. Ctrl+C ends the session. Command
 loss, stale camera progress, or a child-process failure ends following and
 attempts verified torque-off. Support the follower during torque-off. An
 unconfirmed stop requires local power isolation. Restart the follower launcher
 for each new session; there is no automatic reconnect or motion resume.
 
-Logs and received positions are saved privately under `recordings/` on each
+Logs and received actions are saved privately under `recordings/` on each
 computer. Motor activity and stop confirmation appear in the follower run's
-`motors.log`. The journal contains received leader positions, not measured
+`motors.log`. The journal contains received native LeRobot actions, not measured
 follower telemetry. Physical motion and stop performance still require local
 commissioning; automated tests use fake motor hardware.
 
@@ -128,3 +128,7 @@ challenges at 60 Hz and the follower updates on each accepted sample. Video
 remains 30 fps. Actual throughput depends on USB, Wi-Fi, and scheduling. The
 motor log reports measured update rate, leader values, feedback, and targets
 once per second. Speed limits remain in ticks/second, independent of sample rate.
+
+Protocol v3 carries native LeRobot body degrees and gripper 0..100. Update and
+rebuild both computers; old fraction/gamepad clients cannot connect. See
+[LeRobot controls](lerobot-integration.md).

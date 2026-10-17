@@ -59,9 +59,10 @@ with tempfile.TemporaryDirectory(prefix="so101-dual-video-") as directory:
                 count = json.loads(status.read_text())["frames"]
                 assert count >= 20
                 videos.append(count)
-            positions = run / "positions.jsonl"
+            positions = run / "actions.jsonl"
             if positions.exists():
                 records = [json.loads(line) for line in positions.read_text().splitlines()]
+                assert all(r["version"] == 3 and r["units"] == "lerobot_degrees_gripper_percent" and len(r["action"]) == 6 for r in records)
                 samples += len(records)
                 seconds = (records[-1]["received_unix_ns"] - records[0]["received_unix_ns"]) / 1e9
                 measured_hz = (len(records) - 1) / seconds

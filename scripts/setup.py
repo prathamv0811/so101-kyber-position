@@ -13,14 +13,12 @@ def run(args, **kwargs):
 
 
 def linux_build_environment():
-    # Native kynput currently links Linux input libraries even though we only use
-    # its serialization API. Extract headers/linker stubs locally without sudo.
+    # Prepare a private GStreamer H.264 parser without requiring sudo.
+    # Kyber native action transport needs no Linux desktop/input libraries.
     debs, prefix = ROOT / ".cache/debs", ROOT / ".cache/sysroot"
     debs.mkdir(parents=True, exist_ok=True)
     prefix.mkdir(parents=True, exist_ok=True)
-    subprocess.run(["apt-get", "download", "libevdev-dev", "libinput-dev", "libudev-dev",
-        "libxcb-xtest0-dev", "libxcb-xtest0", "libxcb-xfixes0-dev", "libxcb-shape0-dev",
-        "libxcb-render0-dev", "gstreamer1.0-plugins-bad", "libgstreamer-plugins-bad1.0-0"], cwd=debs, check=True)
+    subprocess.run(["apt-get", "download", "gstreamer1.0-plugins-bad", "libgstreamer-plugins-bad1.0-0"], cwd=debs, check=True)
     for deb in debs.glob("*.deb"):
         run(["dpkg-deb", "-x", str(deb), str(prefix)])
     for pc in prefix.rglob("*.pc"):

@@ -62,3 +62,7 @@ application mutual TLS over Tailscale instead, omit `--tailscale` and provision
 role credentials as described in the LAN guide.
 
 The application also supports direct Wi-Fi LAN mode; see [LAN guide](macbook-lan.md).
+
+The client and server now use native LeRobot actions (protocol v3). Stop old
+clients and rebuild both sides. The follower approaches the leader’s absolute
+pose under reviewed bounds and speeds, rather than anchoring relative movement.

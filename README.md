@@ -1,107 +1,136 @@
-# SO-101 Kyber position controller
+# LeRobot SO-101 remote teleoperation with Kyber
 
-A fresh project, independent of Tether. A passive SO-101 leader publishes all
-six measured motor positions through **kynput 0.29.0 input types** and the current
-**KyNet QUIC transport**. A server records those positions and can feed an
-explicitly enabled SO-101 follower. GStreamer supplies top and wrist camera feeds. A combined launcher couples video health to following.
+LeRobot supplies SO-101 control and calibration. Kyber supplies the client/server
+transport for native motor actions and two GStreamer video feeds. The leader is
+on the MacBook; the follower, Logitech top camera, and Sonix wrist camera are on
+the Ubuntu laptop. Control defaults to **60 Hz**, video to **30 fps**.
 
-**Current deployment: leader on a MacBook, follower on this Ubuntu laptop,
-using Tailscale for remote access or direct Wi-Fi LAN.** Start with the
-[Tailscale remote guide](docs/tailscale.md) or the
-[MacBook-to-Ubuntu LAN guide](docs/macbook-lan.md). The laptop's observed LAN
-address is `192.168.101.50`; confirm it before connecting.
+```text
+Mac: SO101Leader.get_action()
+  → Kyber client (KyNet QUIC, native .pos actions)
+  → Tailscale or private LAN
+  → Kyber server → SO101Follower.send_action() → follower motors
 
-```
-Leader USB → LeRobot reader → kynput six-axis packets → TLS/KyNet QUIC
-                                                        ↓
-                                         server JSONL recorder
-                                                        ↓ optional
-                                      bounded relative position controller
-                                                        ↓
-                                                   Follower USB
-
-Top + wrist cameras → GStreamer H.264 → KyProto GOP channels → MacBook windows
+Follower cameras → GStreamer H.264 → KyProto GOP video → Mac video windows
 ```
 
-Joint order is `shoulder_pan`, `shoulder_lift`, `elbow_flex`, `wrist_flex`,
-`wrist_roll`, `gripper`. Wire values are **calibrated fractions (0–4095)**: the leader maps its own
-LeRobot range into 12 bits; the follower maps relative changes into its own range.
-They are not raw servo ticks, radians, degrees, or Cartesian wrist poses. LeRobot acquires the six motors with a synchronized bus read;
-the timestamp precedes acquisition and all six readings travel in one frame.
+The six action keys are `shoulder_pan.pos`, `shoulder_lift.pos`, `elbow_flex.pos`,
+`wrist_flex.pos`, `wrist_roll.pos`, and `gripper.pos`. With LeRobot
+`use_degrees=True`, the five body joints use **degrees** and the gripper uses
+**0..100**. The network preserves these native values as 64-bit floats. There is
+no relative leader anchor or gamepad-axis mapping. The follower approaches the
+leader's absolute pose under reviewed bounds and speed limits.
 
-## SDK and installation
+## Setup
 
-The SDK's current main revision was checked on 2026-10-17. Exact revisions are in
-[SDK.lock.json](SDK.lock.json); the fetched components are tagged `0.29.0`.
-[Kyber 0.29's release notes](https://gitlab.com/kyber/kyber/-/blob/main/blog/2026-10-09-kyber-0-29-0.md)
-describe the new GStreamer capture wrapper. `vendor/kysdk` contains the current
-sources; the project builds `kynput` and `kynet` directly from this checkout.
-
-On this Ubuntu laptop, the isolated LeRobot environment and Rust executable are
-installed and built. To reproduce on Ubuntu or macOS, with `git`, `cargo`, `uv`,
-`pkg-config`, a C compiler and Python installed (Apple Silicon for the current macOS LeRobot/PyTorch stack):
+The repository is public: https://github.com/prathamv0811/so101-kyber-position.
+Install `git`, Rust/Cargo, `uv`, a C compiler, and Python. On Apple Silicon macOS:
 
 ```bash
-cd /home/dev/so101-kyber-position
+brew install rust uv pkg-config gstreamer
+git clone https://github.com/prathamv0811/so101-kyber-position.git
+cd so101-kyber-position
 python3 scripts/setup.py
-source scripts/build-env.sh
-./target/debug/so101-kyber-position --help
 ```
 
-On Ubuntu, setup downloads missing development headers/linker libraries from its
-configured apt repositories into `.cache/sysroot`; it does not require sudo.
-On macOS it uses native system frameworks and skips apt. Setup selects Python
-3.12 through uv. The tested local compiler is Rust 1.98.1. Build separately on the
-MacBook; the laptop's x86 executable is not a macOS application. The physical
-MacBook has not been installed or verified from this session.
+For an existing checkout, run `git pull` and `python3 scripts/setup.py` on both
+computers. Build on each machine; a Linux executable does not run on macOS.
+Setup creates a Python 3.12 environment pinned to `lerobot[feetech]==0.6.1`.
+Ubuntu uses CPU PyTorch. Setup fetches the exact Kyber revisions in
+[SDK.lock.json](SDK.lock.json), corresponding to components tagged 0.29.0.
+It builds the official `kynet`, `kyproto`, and `kymux-types` libraries directly.
 
-The hardware environment pins `lerobot[feetech]==0.6.1`, with CPU PyTorch on this
-Ubuntu laptop. LeRobot supplies the SO-101 arm classes, calibration files and
-motor-bus reads/writes. The GStreamer producer uses Ubuntu's `/usr/bin/python3`
-and `gi`, separately from the LeRobot `.venv`. Required system packages are
-`python3-gi`, `gir1.2-gstreamer-1.0`, `gstreamer1.0-tools`,
-`gstreamer1.0-plugins-base`, `gstreamer1.0-plugins-good`,
-`gstreamer1.0-plugins-bad`, `gstreamer1.0-plugins-ugly`, and
-`gstreamer1.0-libav`. Setup also installs a private H.264 parser plugin when needed.
+The current application does not use `kynput` gamepad emulation for robot
+commands: kynput has no native SO-101 action payload. Native LeRobot actions use
+Kyber's KyNet transport. Video uses the official KyProto GOP stream, not a custom
+video socket or LeRobot camera transport. The full Kyber desktop app and
+`kyavservice` executable are not required.
 
-The implemented camera path is **GStreamer capture/H.264 encoding → official
-Kyber `KyProto::VideoProtocol::GopStream` → H.264 decoding on the MacBook**.
-KyProto manages codec/config packets and GOP video streams over authenticated
-KyNet QUIC. Joint commands use `kynput` input packets over KyNet. No LeRobot
-network transport or LeRobot camera stream is used.
+On Ubuntu, the producer uses `/usr/bin/python3` with GI/GStreamer, separately from
+the LeRobot environment. It needs `python3-gi`, `gir1.2-gstreamer-1.0`,
+`gstreamer1.0-tools`, plugins base/good/bad/ugly, and libav. Setup prepares a private
+H.264 parser plugin when needed. On macOS, Homebrew GStreamer supplies the decoder.
 
-[config/kyber-gstreamer.toml](config/kyber-gstreamer.toml) separately illustrates
-the native `kyavservice` GStreamer configuration. The project directly embeds the
-SDK's KyProto video channel; it does not build the full Kyber desktop/VLC app or
-its `kyavservice` executable. This is an SDK application, not a stock desktop client.
+## Calibration
 
+Run LeRobot calibration locally on each supported, attended arm:
 
-## LeRobot remote teleoperation over Tailscale
+```bash
+# Mac leader: replace the USB path.
+.venv/bin/python calibrate.py leader --port /dev/cu.usbmodemYOUR_DEVICE \
+  --id leader --directory calibration --attended
 
-On the prepared follower laptop, with the supported arm attended:
+# Ubuntu follower: replace the serial path when preparing another machine.
+.venv/bin/python calibrate.py follower --port /dev/serial/by-id/YOUR_FOLLOWER \
+  --id follower --directory calibration --attended
+```
+
+The wrapper invokes official `lerobot-calibrate`; follow its midpoint/range
+prompts. Matching existing calibration may be reused. This laptop's existing
+`follower_2` calibration was verified against all six motors and is stored
+privately as `calibration/follower.json`. The Mac keeps its own
+`calibration/leader.json`; calibration files do not need transferring.
+
+Copy `config/follower.launch.example.json` to
+`config/follower.launch.local.json` and configure actual follower/camera paths.
+Copy `config/follower.example.json` to `follower.local.json`, replace placeholder
+bounds and speeds with reviewed limits inside the follower calibration, then
+set `limits_reviewed=true`. Native SO-101 actions require `invert=false`.
+
+## Start remote teleoperation
+
+Connect both computers to the same authorized Tailscale network. This laptop's
+Tailscale address is **100.79.3.30**. See the [Tailscale guide](docs/tailscale.md)
+for Mac setup, reachability checks, and port access.
+
+On the follower laptop, with the supported arm attended at its power cutoff:
 
 ```bash
 source scripts/build-env.sh
-.venv/bin/python session.py follower --listen-host 100.79.3.30 --tailscale --hz 60 --attended --enable-motion
+.venv/bin/python session.py follower --listen-host 100.79.3.30 \
+  --tailscale --hz 60 --attended --enable-motion
 ```
 
-On the calibrated MacBook leader:
+On the Mac, replace the USB path:
 
 ```bash
 .venv/bin/python session.py operator --host 100.79.3.30 --tailscale --hz 60 \
   --port /dev/cu.usbmodemYOUR_DEVICE --calibration calibration/leader.json
 ```
 
-No application credentials need copying in Tailscale mode; connect both devices
-to the same authorized tailnet. Top video uses UDP 7446, wrist video
-7447, and positions 7445. Both video windows start before leader publishing;
-the follower waits torque-off until fresh input and both streams are available.
-Camera loss and command loss stop following. Omit `--tailscale` on both computers to use paired mutual TLS instead.
-The integration calls LeRobot `get_action`, `get_observation`, and `send_action`;
-see [LeRobot integration](docs/lerobot-integration.md). See the [LAN guide](docs/macbook-lan.md)
-for installation, calibration, local profile setup, and session restart behavior.
+Both video windows start before the client publishes leader actions. The
+follower waits torque-off for fresh input and both streams, preloads its current
+pose, enables torque explicitly, and approaches the absolute leader pose at the
+configured speed. `SO101Follower.send_action()` performs the motor writes and
+applies LeRobot's `max_relative_target` guard. A freshness/limits wrapper uses
+LeRobot's `ensure_safe_goal_position` to preserve the reviewed per-second speed
+limits, including sub-tick progress at 60 Hz.
 
-## Test without hardware
+UDP ports are **7445** for actions, **7446** for top video, and **7447** for wrist
+video. `--tailscale` requires no application credential files: access relies on
+the tailnet connection and policy. QUIC remains encrypted, but this mode does
+not independently authenticate application peers. For paired mutual TLS, omit
+`--tailscale` and provision credentials with `bash scripts/pair.sh credentials`;
+transfer only `credentials/leader/` to the Mac. Direct Wi-Fi LAN also works using
+`--insecure-lan`; see [LAN guide](docs/macbook-lan.md).
+
+Use `--preview-only` on both roles for cameras without opening motors. Use
+`--simulate` on both roles for synthetic cameras/actions without hardware.
+Never connect a simulated publisher to a physical follower.
+
+## Stop, diagnostics, and verification
+
+Ctrl+C stops the session. Missing commands, stale video, malformed input, or a
+process failure stop following and attempt torque-off on all six motors, followed
+by register verification. Support the follower during torque-off; an unconfirmed
+stop requires local power isolation. There is no automatic motion resume.
+The listener handles one operator session; restart explicitly after it ends.
+
+Private run directories under `recordings/` contain `motors.log`, camera/network
+logs, and `actions.jsonl`. Motor logs report actual update rate, input action,
+measured observation, and target once per second. Journals contain received
+leader actions, not measured follower telemetry or proof of execution. Actual
+rate depends on Wi-Fi/Tailscale, USB, and scheduling; 60 Hz is the requested rate.
 
 ```bash
 source scripts/build-env.sh
@@ -112,207 +141,27 @@ cargo test --locked
 .venv/bin/python scripts/test-session.py --insecure-lan
 ```
 
-The smoke test uses real processes, fresh temporary certificates and actual QUIC
-connections. It verifies position recording, sequence order, stale source
-rejection, untrusted peer rejection, publisher-loss watchdog, and GStreamer
-video capture/transport/decoding. It never opens a physical serial/camera device.
+Tests cover native units, exact action transport, absolute pose behavior, 60 Hz
+sampling, source freshness, authentication, connection-loss stop, camera-loss
+stop, both video feeds, and real LeRobot methods with only hardware I/O mocked.
+Physical movement/stop performance and the Mac-to-laptop route still need local
+commissioning. See [LeRobot integration](docs/lerobot-integration.md).
 
-For a manual demonstration, create paired certificates once:
+## Action protocol v3
 
-```bash
-bash scripts/pair.sh credentials
-mkdir -p recordings
-```
+ALPN is `so101-lerobot-action-v3`; older v1/v2 clients are rejected. A 72-byte
+frame contains challenge, sequence, capture Unix nanoseconds (three big-endian
+`u64`s), then six big-endian IEEE-754 `f64`s in the joint order above. The receiver
+reconstructs the exact `.pos` action dictionary. Nonfinite values, body values
+outside -360..360, and gripper values outside 0..100 are rejected; the follower
+also enforces its own stricter calibrated/reviewed bounds.
 
-In terminal A:
+Each server challenge has a 200 ms response deadline. The client keeps only the
+newest sample and rejects input over 100 ms old on its own clock. The follower
+rejects receiver output over 100 ms old on its clock and stops after 200 ms
+without input. Cross-host synchronized clocks are not required for these checks.
+A frame echoing the current challenge with all other bytes zero ends a session.
+These software checks do not establish hardware stop performance.
 
-```bash
-source scripts/build-env.sh
-./target/debug/so101-kyber-position receive \
-  --listen 127.0.0.1:7445 --credentials credentials/server \
-  --output recordings/demo.jsonl
-```
-
-In terminal B:
-
-```bash
-source scripts/build-env.sh
-./target/debug/so101-kyber-position publish \
-  --remote 127.0.0.1:7445 --credentials credentials/leader \
-  --simulate --seconds 10
-```
-
-The receiver also prints accepted NDJSON samples to stdout. Output files are
-created anew and are never overwritten. A receiver handles one session and exits
-when its publisher disconnects; restarting a process is an explicit action.
-
-## Calibrate with LeRobot
-
-Run official LeRobot interactive calibration on each arm's own computer with
-that arm supported and a local power cutoff available. The wrapper below invokes
-`lerobot-calibrate` through its Python module; it does not implement calibration.
-Follow LeRobot's midpoint and range-of-motion prompts.
-
-On the MacBook with the leader:
-
-```bash
-.venv/bin/python calibrate.py leader --port /dev/cu.usbmodemREAL_DEVICE \
-  --id leader --directory calibration --attended
-```
-
-On Ubuntu with the follower:
-
-```bash
-.venv/bin/python calibrate.py follower --port /dev/serial/by-id/REAL_FOLLOWER \
-  --id follower --directory calibration --attended
-```
-
-This saves `calibration/leader.json` and `calibration/follower.json` respectively.
-Use `--calibration calibration/leader.json` for the reader. Keep each arm's calibration on its own computer; protocol v2 needs no calibration transfer.
-The direct equivalent is `.venv/bin/lerobot-calibrate --teleop.type=so101_leader
---teleop.port=... --teleop.id=leader --teleop.calibration_dir=calibration` (use
-`robot`, `so101_follower` and `follower` for the other arm).
-See [LeRobot's SO-101 calibration guide](https://huggingface.co/docs/lerobot/so101#calibrate).
-Calibration is interactive physical work; it has not been run on these arms.
-
-## Publish a physical leader
-
-Identify the leader's **stable serial path**, its calibration and its actual motor
-IDs before opening it. The Ubuntu follower is adapter `5B14030562`. Its existing LeRobot
-`follower_2` calibration has been verified against all six motor registers and
-copied privately to `calibration/follower.json`. The Mac needs its own leader calibration.
-
-Use the LeRobot calibration produced above at `calibration/leader.json`.
-It must contain each joint's `id`, `drive_mode`, `homing_offset`, `range_min`, and
-`range_max`. LeRobot loads the saved calibration and the adapter verifies it against hardware,
-including ranges and homing offsets. STS3215 single-turn mode is required. It refuses a leader with torque enabled and
-never changes torque, mode, offsets or calibration.
-
-After identifying the arm, support it and arrange passive operation locally.
-Then run on the leader computer, replacing `LEADER_SERIAL_PATH` and `SERVER_IP`:
-
-```bash
-set -o pipefail
-source scripts/build-env.sh
-.venv/bin/python hardware.py leader \
-  --port LEADER_SERIAL_PATH --calibration calibration/leader.json --hz 30 |
-./target/debug/so101-kyber-position publish \
-  --remote SERVER_IP:7445 --credentials credentials/leader
-```
-
-On the server, run `receive --listen PRIVATE_SERVER_IP:7445` with its own
-`credentials/server` directory. Both machines need a reachable private LAN/VPN
-route. This project provides no NAT traversal or Internet relay. Permit UDP 7445
-only on the intended private interface. Copy only the correct role's credentials
-to each computer; keep the CA signing key on the provisioning computer.
-
-## Enable a follower after local commissioning
-
-The follower adapter is implemented and tested with fake hardware. **It has not
-been physically commissioned.** Before using it, confirm each arm's identity,
-calibration, joint directions, physical limits, appropriate power and local power
-cutoff with an attendant supporting the follower. Torque disable can let it fall.
-First validate a no-jump enable and stop at the arm, then test short sessions.
-
-Copy `config/follower.example.json` to `follower.local.json`. Every example bound
-is a placeholder. Replace all bounds, speeds and inversion flags with reviewed
-limits inside the follower's own calibration before setting `limits_reviewed`
-to `true`. Keep separate leader/follower calibration files; do not reuse one
-arm's calibration for the other. All structural settings are checked before
-opening the follower.
-
-On the server, with an attendant and supported follower:
-
-```bash
-set -o pipefail
-source scripts/build-env.sh
-./target/debug/so101-kyber-position receive \
-  --listen PRIVATE_SERVER_IP:7445 --credentials credentials/server \
-  --output recordings/physical-session.jsonl |
-.venv/bin/python hardware.py drive \
-  --port FOLLOWER_SERIAL_PATH --config follower.local.json \
-  --follower-calibration calibration/follower.json \
-  --attended --enable-motion
-```
-
-The adapter uses the official LeRobot SO-101 classes and motor bus, connecting
-the bus without enabling torque or triggering implicit calibration. The first
-valid sample anchors relative leader movement to the follower's current
-pose. The controller preloads the current pose before enabling torque, maps
-relative calibrated movement, checks measured bounds and limits per-cycle target
-changes. It attempts torque disable on all six motors on EOF, timeout, Ctrl+C,
-SIGTERM, or an exception, and reads torque registers to confirm the stop.
-An unconfirmed stop is an error requiring local power isolation. There is no
-automatic reconnect, reset or resume. A server journal records **received leader
-positions**, not proof of executed follower motion or measured follower telemetry.
-
-Each exchange uses a server challenge with a 200 ms response deadline; old
-responses cannot be carried into a new exchange. The publisher keeps only the
-latest source sample and rejects samples over 100 ms old on its own clock.
-The follower rejects receiver output over 100 ms old on the server's clock and
-stops after 200 ms without input. This avoids requiring synchronized clocks
-between computers; capture timestamps in recordings still need clock alignment
-for cross-host timing analysis. These software deadlines do not replace a local
-physical power cutoff or establish hardware stop performance.
-
-## Optional GStreamer camera
-
-On the robot computer, omit `--device` for a synthetic test signal:
-
-```bash
-set -o pipefail
-source scripts/build-env.sh
-/usr/bin/python3 camera.py --device CAMERA_BY_ID_PATH |
-./target/debug/so101-kyber-position camera-serve \
-  --listen PRIVATE_SERVER_IP:7446 --credentials credentials/server
-```
-
-On the operator:
-
-```bash
-set -o pipefail
-source scripts/build-env.sh
-./target/debug/so101-kyber-position camera-view \
-  --remote SERVER_IP:7446 --credentials credentials/leader |
-gst-launch-1.0 -q fdsrc ! h264parse ! avdec_h264 ! videoconvert ! autovideosink sync=false
-```
-
-Permit UDP 7446 on the same private interface. The KyProto GOP video channel uses a separate authenticated connection. Raw
-capture queues drop old buffers before encoding; stale encoded input is rejected
-until a keyframe and transport stalls terminate the preview. Use `session.py`
-for coupled operation: it requires both camera streams before publishing or
-enabling torque and stops following on stale video. Standalone commands above
-require explicit `hardware.py drive --video-status` files to couple video health.
-
-## Input protocol
-
-Upstream kynput has no native SO-101 motor-position type. This project uses its
-six `GamepadEvent::Axis` types as a **project-specific virtual position device**,
-with device ID 101. All values are nonnegative calibrated fractions in 0–4095, including both
-trigger axes. The leader converts local raw positions using its own calibration. The custom receiver
-consumes them directly; no OS virtual gamepad or standard game controller
-normalization is involved. Stock Kyber desktop input injection will not drive
-an SO-101 with these packets.
-
-A frame is 78 bytes: challenge, sequence and capture Unix nanoseconds (three
-big-endian `u64` fields), followed by six entries, each containing the kynput
-input-type byte and its eight-byte axis payload. All joints must be present in
-the defined order. The receiver checks framing, discriminants, device ID, ticks,
-sequence and challenge before calling upstream deserialization. TLS 1.3 mutual
-authentication protects both ends by default. Optional `--insecure-lan` requires
-no credential files, uses an ephemeral certificate, and skips peer identity
-verification on explicit private LAN or Tailscale addresses; use only with trusted network access. ALPN distinguishes positions from camera
-frames. Position ALPN v2 rejects older raw-tick clients. This is a custom application on the Kyber SDK rather than a stock
-`kynputserver` deployment.
-
-A frame echoing the current challenge with all remaining bytes zero explicitly
-ends a position session. Both read and publish rates must be 10–120 Hz to stay
-within the watchdog budget; the default is 60 Hz.
-
-Before a live session, the publisher waits up to 30 seconds for LeRobot's first
-sample, allowing imports and USB startup to finish before connecting. The
-follower also waits torque-off for its first fresh sample and anchors to its
-measured pose at that point. The 200 ms live watchdog remains unchanged.
-
-See [LICENSE](LICENSE) for the project's AGPL-3.0-or-later license; upstream SDK
-components retain their own license notices.
+See [LICENSE](LICENSE) for AGPL-3.0-or-later; upstream components retain their own
+license notices.

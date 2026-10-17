@@ -1,50 +1,52 @@
-# LeRobot-based SO-101 remote teleoperation
+# Native LeRobot controls with Kyber client/server transport
 
-This application builds on LeRobot's real SO-101 arm implementations. Kyber
-transports the action samples and GStreamer video; Tailscale provides the remote
-network route. Hardware calibration and motor communication belong to LeRobot.
+The implementation follows the SO-101 action flow in LeRobot's teleoperation loop:
 
-| Operation | LeRobot implementation used |
-| --- | --- |
-| Leader calibration | Official `lerobot-calibrate` with `so101_leader` |
-| Follower calibration | Official `lerobot-calibrate` with `so101_follower` |
-| Leader measurement | `SO101Leader.get_action()` |
-| Follower measurement | `SO101Follower.get_observation()` |
-| Follower goals | `SO101Follower.send_action()` |
-| Startup/stop and calibration verification | The arm's official Feetech motor bus |
+```python
+# MacBook leader client
+native_action = leader.get_action()
+kyber_client.publish(native_action)
 
-`hardware.py` constructs these classes with the matching saved calibration and
-`use_degrees=True`. Five body joints use degrees; the gripper uses 0..100.
-The adapter converts observations to integer ticks for reviewed physical limits,
-then converts bounded goals through LeRobot's own motor normalizer before
-`send_action()`. A compatibility test exercises actual LeRobot arm methods and
-normalization with only physical I/O mocked. Saturated gripper observations get
-a raw register check so normalization cannot hide out-of-calibration positions.
+# Follower server, after freshness and reviewed-limit checks
+observation = follower.get_observation()
+follower.send_action(native_action)
+```
 
-The network contract remains six calibrated fractions in 0..4095 (protocol v2).
-Each arm keeps its own calibration. The first leader frame anchors relative
-movement to the current follower pose. Position goals follow a continuous,
-speed-limited trajectory so sub-tick steps accumulate at 60 Hz. Outstanding
-tracking error is bounded to 100 ms of configured travel (minimum two ticks);
-excess measured error stops the session. Integer goal quantization adds up to
-one tick. Existing joint bounds and speed limits remain active.
+Kyber supplies the network boundary; LeRobot supplies `SO101Leader`,
+`SO101Follower`, their calibration files, motor normalization, safe-goal helper,
+and motor writes. Video uses GStreamer H.264 and Kyber's KyProto GOP stream.
+There is no LeRobot camera/network transport in the remote path.
 
-The local LeRobot source checkout was reviewed at revision
-`146d8474` (which uses the newer Rustypot-backed `SerialMotorsBus`). The
-reproducible application runtime remains pinned to `lerobot[feetech]==0.6.1`
-in `pyproject.toml`/`uv.lock`, which uses `FeetechMotorsBus`; the public SO-101
-arm methods above are shared by both implementations. The application does not
-silently substitute the local checkout or modify it.
+Both arms use `use_degrees=True`: body actions are degrees and the gripper is
+0..100, exactly as in LeRobot. Protocol v3 carries the six `.pos` values as
+64-bit floats and reconstructs the same action dictionary. It replaces the old
+calibrated-fraction/gamepad protocol and relative leader anchor. Both computers
+must update and rebuild. A fixed leader pose now remains an absolute target;
+the follower ramps toward it within reviewed bounds and speed limits.
 
-Startup opens the official bus directly, checks the saved calibration and
-passive torque, and waits for fresh commands plus both camera streams. It avoids
-calling full arm `connect()/configure()` before the motion gate because follower
-configuration can enable torque. Current-position goals are preloaded before
-explicit torque-on. The passive leader check uses one synchronized torque read
-instead of six separate serial round trips. Missing/stale input, stale video,
-exceptions, and shutdown attempt torque-off on all motors and verify it.
+`hardware.py` has a small safety wrapper: it verifies calibration, rejects
+stale/malformed input, checks physical bounds, and uses LeRobot's own
+`ensure_safe_goal_position` to limit target changes per elapsed second.
+`SO101Follower.send_action()` applies `max_relative_target` relative to measured
+position, then performs the actual motor write. Fractional goals accumulate so
+small safe steps do not stall inside the servo dead zone. There is no custom PID
+or alternative motor driver. Tick conversions are used for physical-limit checks;
+the native action values retain their units across the network.
 
-Control requests default to 60 Hz on the leader reader, publisher, and listener.
-The follower updates on accepted frames; actual USB/network timing can reduce the
-rate. `motors.log` reports measured update rate, input, feedback, and targets
-once per second. Video stays at 30 fps. See [remote setup](tailscale.md).
+Startup opens the official bus directly, checks the saved calibration/passive
+torque, and waits for fresh actions plus both camera streams. It avoids full
+`connect()/configure()` before the motion gate because follower configuration
+can enable torque. Current-pose goals are preloaded through `send_action()` before
+explicit torque-on. Stop tries all motors and verifies torque-off. Saturated
+gripper observations get a raw register check so LeRobot's normalization cannot
+hide an out-of-calibration position.
+
+The local LeRobot checkout was reviewed at `146d8474`, which uses the newer
+Rustypot-backed `SerialMotorsBus`. The reproducible runtime stays pinned to
+`lerobot[feetech]==0.6.1`, using `FeetechMotorsBus`; public SO-101 arm methods are
+shared by both. The local checkout is not modified or silently substituted.
+Tests exercise actual LeRobot get/send methods with physical I/O mocked and
+verify signed fractional values across real Kyber QUIC connections.
+
+Control requests default to 60 Hz on reader, client, and server. Video stays
+30 fps. Logs report actual follower update rate. See [remote setup](tailscale.md).
