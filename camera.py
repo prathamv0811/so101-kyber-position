@@ -1,4 +1,4 @@
-"""GStreamer camera producer. Use /usr/bin/python3 for Ubuntu's GI bindings."""
+"""GStreamer H.264 capture/encode source for the Kyber KyProto video channel."""
 import argparse
 import struct
 import sys
@@ -20,9 +20,12 @@ def main():
         import json
         source = "v4l2src device=" + json.dumps(args.device)
     pipeline = Gst.parse_launch(source + " ! videoconvert ! videoscale ! videorate ! "
-        "video/x-raw,width=640,height=480,framerate=30/1 ! "
-        "queue max-size-buffers=1 leaky=downstream ! jpegenc quality=75 ! "
-        "appsink name=frames sync=false max-buffers=1 drop=true")
+        "video/x-raw,format=I420,width=640,height=480,framerate=30/1 ! "
+        "queue max-size-buffers=1 leaky=downstream ! "
+        "x264enc tune=zerolatency speed-preset=ultrafast bitrate=2500 "
+        "key-int-max=15 bframes=0 byte-stream=true ! h264parse config-interval=-1 ! "
+        "video/x-h264,stream-format=byte-stream,alignment=au ! "
+        "appsink name=frames sync=false max-buffers=1 drop=false")
     sink = pipeline.get_by_name("frames")
     bus = pipeline.get_bus()
     pipeline.set_state(Gst.State.PLAYING)
@@ -45,10 +48,14 @@ def main():
                 running = pipeline.get_clock().get_time() - pipeline.get_base_time()
                 if buffer.pts == Gst.CLOCK_TIME_NONE:
                     raise RuntimeError("Camera frame has no capture timestamp")
-                age = max(0, running - buffer.pts)
+                frame_running = sample.get_segment().to_running_time(Gst.Format.TIME, buffer.pts)
+                if frame_running == Gst.CLOCK_TIME_NONE:
+                    raise RuntimeError("Cannot map camera timestamp to running time")
+                age = max(0, running - frame_running)
                 if age > 250_000_000:
                     continue
-                sys.stdout.buffer.write(struct.pack("!IQ", len(data), time.time_ns() - age))
+                is_key = not buffer.has_flags(Gst.BufferFlags.DELTA_UNIT)
+                sys.stdout.buffer.write(struct.pack("!IQB", len(data), time.time_ns() - age, is_key))
                 sys.stdout.buffer.write(data)
                 sys.stdout.buffer.flush()
                 count += 1
@@ -56,7 +63,7 @@ def main():
                 buffer.unmap(mapped)
     finally:
         pipeline.set_state(Gst.State.NULL)
-    print(f"GStreamer produced {count} JPEG frames", file=sys.stderr)
+    print(f"GStreamer produced {count} H.264 access units", file=sys.stderr)
 
 
 if __name__ == "__main__":

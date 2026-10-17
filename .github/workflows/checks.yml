@@ -27,3 +27,15 @@ jobs:
           .venv/bin/python -m unittest discover -s tests -v
       - name: Pairing portability
         run: bash scripts/pair.sh "$RUNNER_TEMP/test-position-credentials"
+      - name: LeRobot calibration CLI imports
+        run: .venv/bin/python -m lerobot.scripts.lerobot_calibrate --help
+      - name: Install GStreamer test runtime (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y python3-gi gir1.2-gstreamer-1.0 gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav
+      - name: Kyber commands and H.264 video integration (Ubuntu)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          source scripts/build-env.sh
+          .venv/bin/python scripts/smoke.py

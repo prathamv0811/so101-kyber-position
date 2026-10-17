@@ -20,13 +20,19 @@ def linux_build_environment():
     prefix.mkdir(parents=True, exist_ok=True)
     subprocess.run(["apt-get", "download", "libevdev-dev", "libinput-dev", "libudev-dev",
         "libxcb-xtest0-dev", "libxcb-xtest0", "libxcb-xfixes0-dev", "libxcb-shape0-dev",
-        "libxcb-render0-dev"], cwd=debs, check=True)
+        "libxcb-render0-dev", "gstreamer1.0-plugins-bad", "libgstreamer-plugins-bad1.0-0"], cwd=debs, check=True)
     for deb in debs.glob("*.deb"):
         run(["dpkg-deb", "-x", str(deb), str(prefix)])
     for pc in prefix.rglob("*.pc"):
         pc.write_text(pc.read_text().replace("prefix=/usr", "prefix=" + str(prefix / "usr")))
     triplet = subprocess.check_output(["dpkg-architecture", "-qDEB_HOST_MULTIARCH"], text=True).strip()
     lib = prefix / "usr/lib" / triplet
+    plugins = ROOT / ".cache/gstreamer"
+    plugins.mkdir(exist_ok=True)
+    parser = lib / "gstreamer-1.0/libgstvideoparsersbad.so"
+    link = plugins / parser.name
+    if not link.exists():
+        link.symlink_to(parser)
     for link in lib.glob("*.so"):
         if link.is_symlink() and not link.exists():
             runtime = Path("/lib") / triplet / link.readlink().name

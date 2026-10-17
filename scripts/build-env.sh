@@ -10,4 +10,5 @@ if [ "$(uname -s)" = Linux ]; then
     export PKG_CONFIG_PATH="$POSITION_ROOT/.cache/sysroot/usr/lib/$POSITION_TRIPLET/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
     export LIBRARY_PATH="$POSITION_ROOT/.cache/sysroot/usr/lib/$POSITION_TRIPLET${LIBRARY_PATH:+:$LIBRARY_PATH}"
     export LD_LIBRARY_PATH="$POSITION_ROOT/.cache/sysroot/usr/lib/$POSITION_TRIPLET${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    export GST_PLUGIN_PATH_1_0="$POSITION_ROOT/.cache/gstreamer${GST_PLUGIN_PATH_1_0:+:$GST_PLUGIN_PATH_1_0}"
 fi

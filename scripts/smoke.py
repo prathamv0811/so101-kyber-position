@@ -87,29 +87,38 @@ def main():
             server.wait(8)
             assert output.stat().st_size == 0
 
-            # Real GStreamer test source -> appsink -> KyNet -> GStreamer decoder.
+            # Real GStreamer H.264 -> official KyProto GOP stream -> decoder.
+            control_address, concurrent_server, concurrent_output = receiver("concurrent-control")
+            concurrent_client = start("concurrent-client", [BIN, "publish", "--remote", control_address,
+                "--credentials", creds / "leader", "--simulate", "--seconds", "3"])
             address = port()
             producer = start("gst-producer", ["/usr/bin/python3", "camera.py", "--frames", "45"], stdout=subprocess.PIPE)
             camera_server = start("camera-server", [BIN, "camera-serve", "--listen", address,
                 "--credentials", creds / "server"], stdin=producer.stdout)
             producer.stdout.close()
             time.sleep(0.1)
-            video = root / "received.mjpeg"
+            video = root / "received.h264"
             with video.open("wb") as stream:
                 viewer = start("camera-viewer", [BIN, "camera-view", "--remote", address,
                     "--credentials", creds / "leader"], stdout=stream)
                 assert viewer.wait(8) == 0, (root / "camera-viewer.log").read_text()
             assert camera_server.wait(5) == 0, (root / "camera-server.log").read_text()
             assert producer.wait(3) == 0, (root / "gst-producer.log").read_text()
-            jpeg_count = video.read_bytes().count(b"\xff\xd8")
-            assert jpeg_count >= 30, jpeg_count
-            decoded = subprocess.run(["gst-launch-1.0", "-q", "filesrc", f"location={video}",
-                "!", "jpegparse", "!", "jpegdec", "!", "fakesink"], capture_output=True, timeout=5)
+            decoded = subprocess.run(["/usr/bin/python3", "scripts/count-video.py", str(video)],
+                capture_output=True, timeout=5)
             assert decoded.returncode == 0, decoded.stderr.decode()
+            frame_count = int(decoded.stdout)
+            assert frame_count >= 30, frame_count
+            assert concurrent_client.wait(6) == 0
+            assert concurrent_server.wait(3) == 0
+            concurrent_samples = len(concurrent_output.read_text().splitlines())
+            assert concurrent_samples >= 60
             print(json.dumps({"passed": True, "sdk": "0.29.0", "position_samples": len(records),
                 "six_joints_atomic": True, "stale_samples_rejected": True,
                 "publisher_loss_watchdog": True, "untrusted_peer_rejected": True,
-                "gstreamer_video_frames": jpeg_count, "gstreamer_decode": True,
+                "gstreamer_video_frames": frame_count, "gstreamer_decode": True,
+                "video_transport": "KyProto GopStream H.264",
+                "concurrent_control_samples": concurrent_samples,
                 "hardware_opened": False}, indent=2))
         except Exception:
             for log in root.glob("*.log"):

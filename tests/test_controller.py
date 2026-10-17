@@ -4,6 +4,7 @@ import unittest
 import tempfile
 import json
 from argparse import Namespace
+from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -74,6 +75,8 @@ class ControllerTests(unittest.TestCase):
             if register == 40:
                 torque[motor] = value
         bus.read, bus.write = read, write
+        bus.driver = SimpleNamespace(sync_read=lambda *_args, **_kwargs: dict.fromkeys(JOINTS, 2000))
+        bus.send_positions = lambda positions: [write(m, 42, p, 2) for m, p in zip(bus.ids, positions)]
         bus.close = lambda: closed.append(True)
         cal = [{"id": i + 1, "range_min": 0, "range_max": 4095, "homing_offset": 0,
                 "drive_mode": 0} for i in range(6)]

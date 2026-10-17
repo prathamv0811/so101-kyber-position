@@ -33,13 +33,13 @@ python3 scripts/setup.py
 
 The repository is private; authenticate to GitHub on the Mac first. `gh repo clone
 prathamv0811/so101-kyber-position` is another option if GitHub CLI is configured.
-Setup supports both Apple Silicon and Intel Macs, builds the pinned SDK natively,
+Setup targets Apple Silicon Macs with the pinned LeRobot/PyTorch stack, builds the SDK natively,
 and creates a Python 3.12 serial environment. It does not run Ubuntu apt commands
 on macOS. The physical MacBook has not been accessed or tested from this session;
 the repository includes a macOS CI build check.
 
 The leader publisher does not need GStreamer. The optional camera viewer can send
-JPEGs to GStreamer or save an MJPEG file; configure the Mac's video tools later
+H.264 to a decoder or save an H.264 file; configure the Mac's video tools later
 if using preview.
 
 ## 2. Pair once on the Ubuntu laptop
@@ -99,9 +99,18 @@ Identify the USB device using:
 ls /dev/cu.usbmodem* /dev/cu.usbserial* 2>/dev/null
 ```
 
-Place that arm's existing LeRobot calibration in `leader.local.json`. It must
-match the actual motor IDs, ranges and homing offsets. The reader verifies those
-offsets and refuses an arm with torque on. It does not recalibrate the arm.
+Calibrate the supported leader using the official LeRobot workflow:
+
+```bash
+.venv/bin/python calibrate.py leader --port /dev/cu.usbmodemREAL_DEVICE \
+  --id leader --directory calibration --attended
+```
+
+Follow its midpoint and range-of-motion prompts. This saves
+`calibration/leader.json`. An existing matching LeRobot calibration may be reused.
+It must
+match the actual motor IDs, ranges and homing offsets. LeRobot loads the saved file; the adapter verifies ranges/offsets against hardware
+and refuses an arm with torque on. Publishing does not recalibrate the arm.
 Start a fresh record-only receiver on Ubuntu, then on the Mac run:
 
 ```bash
@@ -109,7 +118,7 @@ set -o pipefail
 export FOLLOWER_HOST=192.168.101.50
 export LEADER_PORT=/dev/cu.usbmodemREPLACE_WITH_REAL_DEVICE
 .venv/bin/python hardware.py leader \
-  --port "$LEADER_PORT" --calibration leader.local.json --hz 30 |
+  --port "$LEADER_PORT" --calibration calibration/leader.json --hz 30 |
 ./target/debug/so101-kyber-position publish \
   --remote "$FOLLOWER_HOST:7445" --credentials credentials/leader
 ```
@@ -119,9 +128,17 @@ change as expected. This still does not enable follower torque.
 
 ## 5. Commission the follower on Ubuntu
 
-Identify the follower's stable USB path with `ls -l /dev/serial/by-id/`. Place its
-own calibration at `follower-calibration.local.json`. Copy `leader.local.json`
-from the Mac to Ubuntu as well, so relative movement can be mapped correctly.
+Identify the follower's stable USB path with `ls -l /dev/serial/by-id/`, then
+calibrate it using LeRobot on Ubuntu:
+
+```bash
+.venv/bin/python calibrate.py follower --port /dev/serial/by-id/REAL_FOLLOWER \
+  --id follower --directory calibration --attended
+```
+
+This saves its own `calibration/follower.json`. Copy `calibration/leader.json`
+from the Mac into the laptop's `calibration/` directory as well, so relative
+movement can be mapped correctly.
 Copy `config/follower.example.json` to `follower.local.json`, replace all
 placeholder bounds/speeds/inversion flags with reviewed physical limits and
 then set `limits_reviewed` to `true`.
@@ -138,8 +155,8 @@ export FOLLOWER_PORT=/dev/serial/by-id/REPLACE_WITH_FOLLOWER
   --output "recordings/physical-$(date +%Y%m%d-%H%M%S).jsonl" |
 .venv/bin/python hardware.py drive \
   --port "$FOLLOWER_PORT" --config follower.local.json \
-  --leader-calibration leader.local.json \
-  --follower-calibration follower-calibration.local.json \
+  --leader-calibration calibration/leader.json \
+  --follower-calibration calibration/follower.json \
   --attended --enable-motion
 ```
 
@@ -148,3 +165,39 @@ bounded movement, Ctrl+C stop and connection-loss stop in short attended session
 Support the follower during torque-off. The session never resumes automatically.
 Physical behavior on these arms has not yet been verified. See the main README
 for watchdog behavior, recording semantics and the optional GStreamer camera path.
+
+## 6. Stream the laptop camera through the Kyber SDK
+
+Install the Mac's decoder with [Homebrew GStreamer](https://formulae.brew.sh/formula/gstreamer):
+
+```bash
+brew install gstreamer
+```
+
+On Ubuntu, identify the camera with `ls -l /dev/v4l/by-id/`, then in a separate
+terminal from the command receiver start GStreamer capture/H.264 encoding and
+the official KyProto GOP video channel:
+
+```bash
+set -o pipefail
+source scripts/build-env.sh
+/usr/bin/python3 camera.py --device /dev/v4l/by-id/REPLACE_WITH_CAMERA |
+./target/debug/so101-kyber-position camera-serve \
+  --listen 192.168.101.50:7446 --credentials credentials/server
+```
+
+On the MacBook:
+
+```bash
+set -o pipefail
+export FOLLOWER_HOST=192.168.101.50
+./target/debug/so101-kyber-position camera-view \
+  --remote "$FOLLOWER_HOST:7446" --credentials credentials/leader |
+gst-launch-1.0 -q fdsrc ! h264parse ! avdec_h264 ! videoconvert ! autovideosink sync=false
+```
+
+The camera stream and command stream use the same LAN, with separate authenticated
+Kyber connections on UDP 7446 and 7445 respectively. LeRobot handles calibration
+and the USB motor buses; Kyber handles video and network commands. A video failure
+currently ends preview independently of the position controller. The physical
+Mac display and USB camera have not been commissioned by automated tests.

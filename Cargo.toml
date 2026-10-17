@@ -10,6 +10,8 @@ bytes = "1"
 clap = { version = "4", features = ["derive"] }
 kynput = { path = "vendor/kysdk/kynput/kynput", default-features = false }
 kynet = { path = "vendor/kysdk/kymux/kynet", features = ["kynet-quinn"] }
+kyproto = { path = "vendor/kysdk/kymux/kyproto" }
+kymux-types = { path = "vendor/kysdk/kymux/kymux-types" }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 rustls-pemfile = "2"

@@ -1,3 +1,4 @@
+mod media;
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
 use kynput::{GamepadAxis, GamepadEvent, InputPacket, InputTarget, InputType, Payload};
@@ -32,14 +33,14 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
-    /// Serve a GStreamer-produced length-prefixed JPEG feed to one authenticated viewer.
+    /// Serve GStreamer H.264 through an authenticated KyProto GOP video channel.
     CameraServe {
         #[arg(long, default_value = "127.0.0.1:7446")]
         listen: SocketAddr,
         #[arg(long)]
         credentials: PathBuf,
     },
-    /// Receive JPEG frames; stdout can be piped to GStreamer jpegparse/jpegdec.
+    /// Receive H.264 from the KyProto video channel; stdout is an Annex-B stream.
     CameraView {
         #[arg(long)]
         remote: SocketAddr,
@@ -172,133 +173,6 @@ fn transport() -> Arc<quinn::TransportConfig> {
     config.max_idle_timeout(Some(Duration::from_secs(3).try_into().unwrap()));
     config.keep_alive_interval(Some(Duration::from_millis(250)));
     Arc::new(config)
-}
-
-fn server_endpoint(listen: SocketAddr, credentials: &Path) -> Result<quinn::Endpoint> {
-    let verifier =
-        rustls::server::WebPkiClientVerifier::builder(Arc::new(roots(credentials)?)).build()?;
-    let mut tls = rustls::ServerConfig::builder()
-        .with_client_cert_verifier(verifier)
-        .with_single_cert(
-            certs(&credentials.join("cert.pem"))?,
-            key(&credentials.join("key.pem"))?,
-        )?;
-    tls.alpn_protocols = vec![b"so101-camera-jpeg-v1".to_vec()];
-    let mut config = quinn::ServerConfig::with_crypto(Arc::new(
-        quinn::crypto::rustls::QuicServerConfig::try_from(tls)?,
-    ));
-    config.transport = transport();
-    Ok(quinn::Endpoint::server(config, listen)?)
-}
-
-async fn camera_serve(listen: SocketAddr, credentials: &Path) -> Result<()> {
-    let endpoint = server_endpoint(listen, credentials)?;
-    eprintln!("Camera listening on {}", endpoint.local_addr()?);
-    let raw = tokio::time::timeout(
-        Duration::from_secs(5),
-        endpoint.accept().await.context("Listener closed")?,
-    )
-    .await??;
-    let conn = kynet::Connection::from(raw);
-    let (mut send, mut recv) = conn.open_bi().await?;
-    let mut stdin = tokio::io::stdin();
-    loop {
-        let mut header = [0; 12];
-        if let Err(error) = stdin.read_exact(&mut header).await {
-            if error.kind() == std::io::ErrorKind::UnexpectedEof {
-                break;
-            }
-            return Err(error.into());
-        }
-        let size = u32::from_be_bytes(header[..4].try_into().unwrap()) as usize;
-        ensure!((4..=2_000_000).contains(&size), "Invalid JPEG frame length");
-        let mut image = vec![0; size];
-        stdin.read_exact(&mut image).await?;
-        let timestamp = u64::from_be_bytes(header[4..].try_into().unwrap());
-        let age = now_ns()
-            .checked_sub(timestamp)
-            .context("Future camera timestamp")?;
-        if age > 250_000_000 {
-            continue;
-        } // discard capture backlog before transport
-        tokio::time::timeout(Duration::from_millis(500), async {
-            send.write_all(&header).await?;
-            send.write_all(&image).await?;
-            Ok::<_, anyhow::Error>(())
-        })
-        .await
-        .context("Camera transport stalled")??;
-    }
-    send.write_all(&[0; 12]).await?;
-    let mut acknowledgement = [0];
-    tokio::time::timeout(
-        Duration::from_secs(1),
-        recv.read_exact(&mut acknowledgement),
-    )
-    .await??;
-    ensure!(
-        acknowledgement == *b"F",
-        "Missing camera completion acknowledgement"
-    );
-    conn.close(0, "Camera source ended");
-    endpoint.wait_idle().await;
-    Ok(())
-}
-
-async fn camera_view(remote: SocketAddr, credentials: &Path, server_name: &str) -> Result<()> {
-    let mut tls = rustls::ClientConfig::builder()
-        .with_root_certificates(roots(credentials)?)
-        .with_client_auth_cert(
-            certs(&credentials.join("cert.pem"))?,
-            key(&credentials.join("key.pem"))?,
-        )?;
-    tls.alpn_protocols = vec![b"so101-camera-jpeg-v1".to_vec()];
-    let mut config = quinn::ClientConfig::new(Arc::new(
-        quinn::crypto::rustls::QuicClientConfig::try_from(tls)?,
-    ));
-    config.transport_config(transport());
-    let bind = if remote.is_ipv4() {
-        "0.0.0.0:0"
-    } else {
-        "[::]:0"
-    };
-    let endpoint = quinn::Endpoint::client(bind.parse()?)?;
-    let raw = tokio::time::timeout(
-        Duration::from_secs(5),
-        endpoint.connect_with(config, remote, server_name)?,
-    )
-    .await??;
-    let conn = kynet::Connection::from(raw);
-    let (mut send, mut recv) =
-        tokio::time::timeout(Duration::from_secs(3), conn.accept_bi()).await??;
-    let mut stdout = tokio::io::stdout();
-    loop {
-        let mut header = [0; 12];
-        if let Err(error) =
-            tokio::time::timeout(Duration::from_millis(750), recv.read_exact(&mut header)).await?
-        {
-            if error.kind() == std::io::ErrorKind::UnexpectedEof {
-                break;
-            }
-            return Err(error.into());
-        }
-        let size = u32::from_be_bytes(header[..4].try_into().unwrap()) as usize;
-        if size == 0 {
-            send.write_all(b"F").await?;
-            tokio::time::timeout(Duration::from_secs(1), conn.closed()).await??;
-            break;
-        }
-        ensure!((4..=2_000_000).contains(&size), "Invalid JPEG frame length");
-        let mut image = vec![0; size];
-        tokio::time::timeout(Duration::from_millis(500), recv.read_exact(&mut image)).await??;
-        ensure!(
-            image.starts_with(&[0xff, 0xd8]) && image.ends_with(&[0xff, 0xd9]),
-            "Invalid JPEG frame"
-        );
-        stdout.write_all(&image).await?;
-        stdout.flush().await?;
-    }
-    Ok(())
 }
 
 async fn receive(listen: SocketAddr, credentials: &Path, output: &Path) -> Result<()> {
@@ -504,12 +378,12 @@ async fn main() -> Result<()> {
         Command::CameraServe {
             listen,
             credentials,
-        } => camera_serve(listen, &credentials).await,
+        } => media::serve(listen, &credentials).await,
         Command::CameraView {
             remote,
             credentials,
             server_name,
-        } => camera_view(remote, &credentials, &server_name).await,
+        } => media::view(remote, &credentials, &server_name).await,
         Command::Receive {
             listen,
             credentials,

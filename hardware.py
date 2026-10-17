@@ -1,4 +1,4 @@
-"""Fresh SO-101 serial adapters. No dependency on the existing Tether checkout.
+"""LeRobot SO-101 adapters with Kyber carrying all remote commands.
 
 Joint order: shoulder_pan, shoulder_lift, elbow_flex, wrist_flex, wrist_roll, gripper.
 Positions are calibrated servo register ticks, not radians or Cartesian poses.
@@ -16,36 +16,48 @@ JOINTS = ("shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_ro
 
 
 class Bus:
-    def __init__(self, port, ids):
-        import scservo_sdk as sdk
-        self.sdk = sdk
+    REGISTERS = {3: "Model_Number", 31: "Homing_Offset", 33: "Operating_Mode",
+                 40: "Torque_Enable", 42: "Goal_Position", 56: "Present_Position"}
+
+    def __init__(self, port, ids, calibration_path, role):
+        from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
+        from lerobot.teleoperators.so_leader import SO101Leader, SO101LeaderConfig
+        path = Path(calibration_path).resolve()
+        if ids != list(range(1, 7)):
+            raise ValueError("LeRobot SO-101 requires joint motor IDs 1 through 6")
+        options = {"port": port, "id": path.stem, "calibration_dir": path.parent}
+        self.arm = (SO101Leader(SO101LeaderConfig(**options)) if role == "leader"
+                    else SO101Follower(SO101FollowerConfig(**options, cameras={})))
+        self.driver = self.arm.bus
         self.ids = ids
-        self.port = sdk.PortHandler(port)
-        self.packet = sdk.PacketHandler(0)  # STS3215: protocol 0, little-endian registers
-        if not self.port.openPort():
-            raise RuntimeError(f"Cannot open {port}")
-        if not self.port.setBaudRate(1_000_000):
-            self.close()
-            raise RuntimeError("Cannot set 1 Mbaud")
+        # Open the official bus without SOFollower.configure(), whose torque
+        # context would otherwise enable torque before our explicit motion gate.
+        try:
+            self.driver.connect()
+            if not self.driver.is_calibrated:
+                raise RuntimeError("LeRobot calibration differs from hardware; run calibrate.py locally")
+        except BaseException:
+            self.driver.port_handler.closePort()
+            raise
+
+    def name(self, motor):
+        return JOINTS[self.ids.index(motor)]
 
     def read(self, motor, address, size):
-        fn = self.packet.read1ByteTxRx if size == 1 else self.packet.read2ByteTxRx
-        value, communication, error = fn(self.port, motor, address)
-        if communication != self.sdk.COMM_SUCCESS or error:
-            raise RuntimeError(f"Motor {motor}, register {address}: communication={communication}, error={error}")
-        return value
+        return self.driver.read(self.REGISTERS[address], self.name(motor), normalize=False, num_retry=2)
 
     def write(self, motor, address, value, size=1):
-        fn = self.packet.write1ByteTxRx if size == 1 else self.packet.write2ByteTxRx
-        communication, error = fn(self.port, motor, address, value)
-        if communication != self.sdk.COMM_SUCCESS or error:
-            raise RuntimeError(f"Motor {motor} write failed: communication={communication}, error={error}")
+        self.driver.write(self.REGISTERS[address], self.name(motor), value, normalize=False, num_retry=2)
 
     def positions(self):
-        values = [self.read(motor, 56, 2) for motor in self.ids]
+        result = self.driver.sync_read("Present_Position", normalize=False, num_retry=2)
+        values = [result[name] for name in JOINTS]
         if any(not 0 <= value <= 4095 for value in values):
             raise RuntimeError("Position outside single-turn range")
         return values
+
+    def send_positions(self, positions):
+        self.driver.sync_write("Goal_Position", dict(zip(JOINTS, positions)), normalize=False, num_retry=2)
 
     def require_passive(self):
         if any(self.read(motor, 40, 1) != 0 for motor in self.ids):
@@ -69,7 +81,7 @@ class Bus:
             raise RuntimeError("STOP NOT CONFIRMED; use local power cutoff: " + "; ".join(errors))
 
     def close(self):
-        self.port.closePort()
+        self.driver.disconnect(disable_torque=False)  # stop() verifies all torque registers first
 
 
 def calibration(path):
@@ -96,8 +108,7 @@ def calibration(path):
 def verify_calibration(bus, cal):
     for motor in cal:
         # Do not change servo configuration. A mismatch requires local calibration.
-        raw = bus.read(motor["id"], 31, 2)
-        offset = -(raw & 2047) if raw & 2048 else raw
+        offset = bus.read(motor["id"], 31, 2)  # LeRobot decodes sign-magnitude
         if offset != motor["homing_offset"] or bus.read(motor["id"], 33, 1) != 0:
             raise RuntimeError(f"Motor {motor['id']}: saved offset/mode doesn't match hardware")
         if bus.read(motor["id"], 3, 2) != 777:
@@ -106,7 +117,7 @@ def verify_calibration(bus, cal):
 
 def leader(args):
     cal = calibration(args.calibration)
-    bus = Bus(args.port, [m["id"] for m in cal])
+    bus = Bus(args.port, [m["id"] for m in cal], args.calibration, "leader")
     try:
         bus.require_passive()
         verify_calibration(bus, cal)
@@ -212,7 +223,7 @@ def drive(args):
     validation_pose = [(config["joints"][name]["min_ticks"] + config["joints"][name]["max_ticks"]) // 2
                        for name in JOINTS]
     PositionController(config, lc, fc, validation_pose)
-    bus = Bus(args.port, [m["id"] for m in fc])
+    bus = Bus(args.port, [m["id"] for m in fc], args.follower_calibration, "follower")
     touched = False
     try:
         bus.require_passive()
@@ -235,10 +246,9 @@ def drive(args):
             # A sample carries a server challenge bounded to 200 ms. Each hardware
             # cycle must finish within 100 ms; a local read/write fault ends the session.
             started = time.monotonic()
-            for motor, target in zip(bus.ids, targets):
-                bus.write(motor, 42, target, 2)
-                if time.monotonic() - started > 0.1:
-                    raise TimeoutError("Motor write cycle exceeded 100 ms")
+            bus.send_positions(targets)
+            if time.monotonic() - started > 0.1:
+                raise TimeoutError("Motor write cycle exceeded 100 ms")
     finally:
         try:
             if touched:

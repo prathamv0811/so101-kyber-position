@@ -6,3 +6,4 @@
 /recordings/
 *.local.json
 __pycache__/
+/calibration/

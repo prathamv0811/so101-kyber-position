@@ -2,4 +2,13 @@
 name = "so101-kyber-hardware"
 version = "0.1.0"
 requires-python = ">=3.12"
-dependencies = ["feetech-servo-sdk==1.0.0", "pyserial==3.5"]
+dependencies = ["lerobot[feetech]==0.6.1", "torch==2.11.0", "torchvision==0.26.0"]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" }]
+torchvision = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" }]
