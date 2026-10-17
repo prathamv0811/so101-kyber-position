@@ -7,6 +7,7 @@ import argparse
 import json
 import logging
 import math
+import os
 import select
 import signal
 import sys
@@ -182,11 +183,20 @@ def leader(args):
         print(f"LeRobot SO-101 leader ready at {args.hz} Hz on {args.port}", file=sys.stderr)
         period = 1 / args.hz
         deadline = time.monotonic()
+        reported, updates, maximum_cycle = deadline, 0, 0
         while True:
+            cycle = time.monotonic()
             captured = time.time_ns()  # includes serial acquisition time in freshness checks
             bus.require_passive()
             action = bus.get_action()
             print(json.dumps({"captured_unix_ns": captured, "action": action}), flush=True)
+            now = time.monotonic()
+            updates += 1
+            maximum_cycle = max(maximum_cycle, now - cycle)
+            if now - reported >= 1:
+                print(f"Leader sampling rate={updates / (now - reported):.1f} Hz "
+                      f"max_acquisition_ms={maximum_cycle * 1000:.1f}", file=sys.stderr)
+                reported, updates, maximum_cycle = now, 0, 0
             deadline = max(deadline + period, time.monotonic())
             time.sleep(max(0, deadline - time.monotonic()))
     finally:
@@ -254,23 +264,55 @@ class LeRobotControls:
         self.command = dict(validate_action(actual))
 
 
+class SampleReader:
+    """Drain complete records already waiting in the pipe; apply only the newest.
+
+    OS reads avoid TextIOWrapper prefetch hiding records from select(). A partial
+    last record stays buffered until the next read, without delaying a fresh one.
+    """
+    def __init__(self, fd):
+        self.fd, self.buffer, self.eof = fd, bytearray(), False
+
+    def read(self, timeout):
+        deadline = time.monotonic() + timeout
+        latest, drained = None, 0
+        while True:
+            while b"\n" in self.buffer:
+                line, _, rest = self.buffer.partition(b"\n")
+                self.buffer = bytearray(rest)
+                if len(line) > 2048:
+                    raise ValueError("Oversized receiver record")
+                latest = json.loads(line)
+            if len(self.buffer) > 2048:
+                raise ValueError("Oversized receiver record")
+            if self.eof:
+                if latest is not None:
+                    return latest
+                raise EOFError("Receiver disconnected")
+            remaining = deadline - time.monotonic()
+            ready = select.select([self.fd], [], [], 0 if latest is not None else max(0, remaining))[0]
+            if not ready:
+                if latest is not None:
+                    return latest
+                raise TimeoutError("Position input watchdog expired")
+            chunk = os.read(self.fd, 4096)
+            if not chunk:
+                self.eof = True
+                continue
+            drained += len(chunk)
+            if drained > 65536:
+                raise ValueError("Receiver record flood")
+            self.buffer.extend(chunk)
+
+
+_sample_reader = None
+
+
 def read_sample(timeout):
-    # Use unbuffered OS reads, so select cannot miss data prefetched by TextIOWrapper.
-    import os
-    deadline = time.monotonic() + timeout
-    line = bytearray()
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0 or not select.select([sys.stdin.fileno()], [], [], remaining)[0]:
-            raise TimeoutError("Position input watchdog expired")
-        byte = os.read(sys.stdin.fileno(), 1)
-        if not byte:
-            raise EOFError("Receiver disconnected")
-        if byte == b"\n":
-            return json.loads(line)
-        line.extend(byte)
-        if len(line) > 2048:
-            raise ValueError("Oversized receiver record")
+    global _sample_reader
+    if _sample_reader is None:
+        _sample_reader = SampleReader(sys.stdin.fileno())
+    return _sample_reader.read(timeout)
 
 
 def first_sample(timeout=30):
@@ -304,6 +346,8 @@ def drive(args):
     # Validate reviewed config before opening any hardware.
     if config.get("limits_reviewed") is not True:
         raise ValueError("Physical limits have not been reviewed")
+    print("Motion speed limits (ticks/s): " + json.dumps({
+        name: config["joints"][name]["max_ticks_per_second"] for name in JOINTS}), file=sys.stderr)
     validation_pose = [(config["joints"][name]["min_ticks"] + config["joints"][name]["max_ticks"]) // 2
                        for name in JOINTS]
     LeRobotControls(config, fc, ticks_to_action(validation_pose, fc))

@@ -63,6 +63,8 @@ role credentials as described in the LAN guide.
 
 The application also supports direct Wi-Fi LAN mode; see [LAN guide](macbook-lan.md).
 
-The client and server now use native LeRobot actions (protocol v3). Stop old
+The client and server now use native LeRobot actions over datagram transport v4. Stop old
 clients and rebuild both sides. The follower approaches the leader’s absolute
 pose under reviewed bounds and speeds, rather than anchoring relative movement.
+Commands publish continuously at the requested rate; they no longer wait for
+an acknowledgement on every cycle. Freshness beacons still expire after 200 ms.

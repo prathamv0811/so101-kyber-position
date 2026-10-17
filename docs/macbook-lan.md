@@ -124,11 +124,11 @@ The software does not change firewall settings or require router port forwarding
 
 Control defaults to **120 Hz** on both roles (`--hz 120`). The Mac passes this to
 both the LeRobot leader reader and network publisher; the listener paces
-challenges at 120 Hz and the follower updates on each accepted sample. Video
+latest actions at up to 120 Hz and the follower skips queued old samples. Video
 remains 30 fps. Actual throughput depends on USB, Wi-Fi, and scheduling. The
 motor log reports measured update rate, leader values, feedback, and targets
 once per second. Speed limits remain in ticks/second, independent of sample rate.
 
-Protocol v3 carries native LeRobot body degrees and gripper 0..100. Update and
-rebuild both computers; old fraction/gamepad clients cannot connect. See
+Transport v4 carries native LeRobot body degrees and gripper 0..100. Update and
+rebuild both computers; older transport clients cannot connect. See
 [LeRobot controls](lerobot-integration.md).

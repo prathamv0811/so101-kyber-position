@@ -137,6 +137,7 @@ source scripts/build-env.sh
 cargo test --locked
 .venv/bin/python -m unittest discover -s tests -v
 .venv/bin/python scripts/smoke.py
+.venv/bin/python scripts/test-control-delay.py
 .venv/bin/python scripts/test-camera-startup.py
 .venv/bin/python scripts/test-session.py
 .venv/bin/python scripts/test-session.py --insecure-lan
@@ -148,21 +149,33 @@ stop, both video feeds, and real LeRobot methods with only hardware I/O mocked.
 Physical movement/stop performance and the Mac-to-laptop route still need local
 commissioning. See [LeRobot integration](docs/lerobot-integration.md).
 
-## Action protocol v3
+## Action transport v4
 
-ALPN is `so101-lerobot-action-v3`; older v1/v2 clients are rejected. A 72-byte
-frame contains challenge, sequence, capture Unix nanoseconds (three big-endian
+ALPN is `so101-lerobot-action-datagram-v4`; both computers must rebuild. A 72-byte
+QUIC datagram contains challenge, sequence, capture Unix nanoseconds (three big-endian
 `u64`s), then six big-endian IEEE-754 `f64`s in the joint order above. The receiver
 reconstructs the exact `.pos` action dictionary. Nonfinite values, body values
 outside -360..360, and gripper values outside 0..100 are rejected; the follower
 also enforces its own stricter calibrated/reviewed bounds.
 
-Each server challenge has a 200 ms response deadline. The client keeps only the
-newest sample and rejects input over 100 ms old on its own clock. The follower
+The server sends freshness challenges every 20 ms, valid for 200 ms. The publisher
+sends the latest native action at the requested rate without waiting for a
+round-trip acknowledgement for each action. Lost/old datagrams are skipped;
+small queues and latest-only delivery prevent replaying a command backlog.
+The journal retains native action format `version: 3` and adds `transport_version: 4`.
+`challenge_age_ms` reports the age of the echoed beacon, not action latency or RTT.
+The client rejects source input over 100 ms old on its own clock. The follower
 rejects receiver output over 100 ms old on its clock and stops after 200 ms
 without input. Cross-host synchronized clocks are not required for these checks.
-A frame echoing the current challenge with all other bytes zero ends a session.
+A reliable control stream carries explicit session start/stop markers.
 These software checks do not establish hardware stop performance.
+
+Increasing `--hz` does not change physical speed limits. For example, a configured
+100 ticks/s permits only about 8.8 degrees/s on body joints: a 45-degree leader
+movement takes at least 5.1 seconds to catch up. Review the per-joint
+`max_ticks_per_second` in the private follower profile separately. Motion logs
+print the active speeds; Mac `leader.log` prints measured sampling rate and the
+maximum acquisition time each second.
 
 See [LICENSE](LICENSE) for AGPL-3.0-or-later; upstream components retain their own
 license notices.
@@ -183,5 +196,5 @@ thread and the display queue keeps one decoded frame, with display sync disabled
 Each camera is 640×480 at 30 fps, initially 1200 kbit/s. Actual latency still
 depends on exposure, USB, the network, decoding, and display hardware.
 
-The existing motion bounds, speed limits, and tracking checks remain active.
-Only the command sampling target has increased to 120 Hz.
+The transport changes preserve the configured motion bounds, speed limits,
+tracking checks, and disconnect stops.

@@ -54,7 +54,8 @@ def main():
             assert server.wait(3) == 0, (root / "normal.log").read_text()
             records = [json.loads(line) for line in output.read_text().splitlines()]
             assert len(records) >= 40, len(records)
-            assert [r["seq"] for r in records] == list(range(1, len(records) + 1))
+            assert all(a["seq"] < b["seq"] for a, b in zip(records, records[1:]))
+            assert all(r["transport_version"] == 4 and r["challenge_age_ms"] <= 200 for r in records)
             assert all(r["version"] == 3 and len(r["action"]) == 6 for r in records)
 
             # Model delayed LeRobot imports/USB initialization before its first sample.

@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import sys
 import tempfile
 import time
@@ -10,7 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from hardware import Bus, JOINTS, LeRobotControls, action_to_ticks, drive, require_video, ticks_to_action
+from hardware import Bus, JOINTS, LeRobotControls, SampleReader, action_to_ticks, drive, require_video, ticks_to_action
 
 
 class ControllerTests(unittest.TestCase):
@@ -101,6 +102,25 @@ class ControllerTests(unittest.TestCase):
             status.write_text(json.dumps({"frames": 10, "updated_unix_ns": time.time_ns() - 600_000_000}))
             with self.assertRaisesRegex(RuntimeError, "Camera stream stale"):
                 require_video([status])
+
+    def test_receiver_pipe_delivers_latest_complete_record_without_replaying_backlog(self):
+        read_fd, write_fd = os.pipe()
+        try:
+            reader = SampleReader(read_fd)
+            os.write(write_fd, b'{"seq":1}\n{"seq":2}\n{"seq":')
+            self.assertEqual(reader.read(.1), {"seq": 2})
+            os.write(write_fd, b'3}\n')
+            self.assertEqual(reader.read(.1), {"seq": 3})
+            with self.assertRaisesRegex(TimeoutError, "watchdog"):
+                reader.read(.01)
+            os.close(write_fd)
+            write_fd = None
+            with self.assertRaises(EOFError):
+                reader.read(.1)
+        finally:
+            os.close(read_fd)
+            if write_fd is not None:
+                os.close(write_fd)
 
     def test_input_loss_after_enable_disables_all_motors(self):
         self.exercise_drive_fault()

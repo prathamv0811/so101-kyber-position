@@ -4,7 +4,7 @@ use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     fs::OpenOptions,
     io::Write,
     net::SocketAddr,
@@ -14,7 +14,7 @@ use std::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-const ALPN: &[u8] = b"so101-lerobot-action-v3";
+const ALPN: &[u8] = b"so101-lerobot-action-datagram-v4";
 const FRAME_LEN: usize = 24 + 6 * 8;
 const DEADLINE: Duration = Duration::from_millis(200);
 const JOINTS: [&str; 6] = [
@@ -71,7 +71,7 @@ enum Command {
         insecure_lan: bool,
         #[arg(long)]
         output: PathBuf,
-        /// Maximum command challenge rate; follower updates follow accepted samples.
+        /// Maximum rate of latest-action delivery to the follower.
         #[arg(long, default_value_t = 120)]
         hz: u32,
     },
@@ -187,7 +187,38 @@ fn transport() -> Arc<quinn::TransportConfig> {
     let mut config = quinn::TransportConfig::default();
     config.max_idle_timeout(Some(Duration::from_secs(3).try_into().unwrap()));
     config.keep_alive_interval(Some(Duration::from_millis(250)));
+    // A command fits in one datagram. Prefer new actions when the network stalls.
+    config.datagram_send_buffer_size(FRAME_LEN * 2);
+    config.datagram_receive_buffer_size(Some(FRAME_LEN * 4));
     Arc::new(config)
+}
+
+#[derive(Default)]
+struct Challenges {
+    issued: VecDeque<(u64, Instant)>,
+    next: u64,
+}
+
+impl Challenges {
+    fn issue(&mut self, now: Instant) -> Result<u64> {
+        while self
+            .issued
+            .front()
+            .is_some_and(|(_, at)| now.duration_since(*at) > DEADLINE)
+        {
+            self.issued.pop_front();
+        }
+        self.next = self.next.checked_add(1).context("Challenge overflow")?;
+        self.issued.push_back((self.next, now));
+        Ok(self.next)
+    }
+
+    fn age(&self, nonce: u64, now: Instant) -> Option<Duration> {
+        self.issued.iter().find_map(|(value, at)| {
+            let age = now.duration_since(*at);
+            (*value == nonce && age <= DEADLINE).then_some(age)
+        })
+    }
 }
 
 async fn receive(
@@ -214,43 +245,68 @@ async fn receive(
     let raw = tokio::time::timeout(Duration::from_secs(5), incoming).await??;
     tls::address(raw.remote_address(), insecure_lan)?;
     let conn = kynet::Connection::from(raw);
-    let (mut send, mut recv) =
+    let (_send, mut recv) =
         tokio::time::timeout(Duration::from_secs(3), conn.accept_bi()).await??;
     let mut marker = [0];
     tokio::time::timeout(DEADLINE, recv.read_exact(&mut marker)).await??;
     ensure!(marker == *b"P", "Invalid protocol marker");
     let mut seq = 0;
-    let mut challenge = 1u64;
+    let mut delivered = 0;
+    let mut challenges = Challenges::default();
+    let mut pending = None;
+    let mut last_input = tokio::time::Instant::now();
+    let mut beacons = tokio::time::interval(Duration::from_millis(20));
+    beacons.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut interval = tokio::time::interval(Duration::from_secs_f64(1.0 / hz as f64));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut stop = [0];
     let outcome: Result<()> = async {
         loop {
-            interval.tick().await;
-            let issued = Instant::now();
-            let mut frame = [0u8; FRAME_LEN];
-            tokio::time::timeout(DEADLINE, async {
-                send.write_all(&challenge.to_be_bytes()).await?;
-                recv.read_exact(&mut frame).await?;
-                Ok::<_, anyhow::Error>(())
-            }).await.context("Publisher freshness watchdog expired")??;
-            if frame[..8] == challenge.to_be_bytes() && frame[8..].iter().all(|&byte| byte == 0) {
-                break Ok(());
+            tokio::select! {
+                _ = tokio::time::sleep_until(last_input + DEADLINE) => {
+                    anyhow::bail!("Publisher freshness watchdog expired");
+                }
+                result = recv.read_exact(&mut stop) => {
+                    result?;
+                    ensure!(stop == *b"S", "Invalid stop marker");
+                    break Ok(());
+                }
+                _ = beacons.tick() => {
+                    let nonce = challenges.issue(Instant::now())?;
+                    conn.send_datagram(bytes::Bytes::copy_from_slice(&nonce.to_be_bytes())).await?;
+                }
+                result = conn.read_datagram() => {
+                    let frame = result?;
+                    ensure!(frame.len() == FRAME_LEN, "Invalid action datagram length");
+                    let nonce = u64::from_be_bytes(frame[..8].try_into()?);
+                    let incoming_seq = u64::from_be_bytes(frame[8..16].try_into()?);
+                    // Datagram loss/reordering is normal. Neither old sequence numbers
+                    // nor an expired challenge can refresh the input watchdog.
+                    if incoming_seq <= seq { continue; }
+                    let Some(age) = challenges.age(nonce, Instant::now()) else { continue; };
+                    let (new_seq, sample) = decode(&frame, nonce, seq)?;
+                    seq = new_seq;
+                    last_input = tokio::time::Instant::now();
+                    pending = Some((new_seq, sample, now_ns(), age));
+                }
+                _ = interval.tick() => {
+                    let Some((new_seq, sample, received, age)) = pending.take() else { continue; };
+                    ensure!(now_ns().saturating_sub(received) <= 100_000_000, "Local action delivery stalled");
+                    let record = serde_json::json!({"version":3,"transport_version":4,
+                        "units":"lerobot_degrees_gripper_percent","seq":new_seq,
+                        "captured_unix_ns":sample.captured_unix_ns,"received_unix_ns":received,
+                        "action":sample.action,"challenge_age_ms":age.as_secs_f64()*1000.0});
+                    let line = serde_json::to_string(&record)?;
+                    writeln!(journal, "{line}")?;
+                    println!("{line}");
+                    delivered += 1;
+                }
             }
-            let (new_seq, sample) = decode(&frame, challenge, seq)?;
-            let record = serde_json::json!({"version":3,"units":"lerobot_degrees_gripper_percent","seq":new_seq,
-                "captured_unix_ns":sample.captured_unix_ns,"received_unix_ns":now_ns(),
-                "action":sample.action,"challenge_round_trip_ms":issued.elapsed().as_secs_f64()*1000.0});
-            let line = serde_json::to_string(&record)?;
-            writeln!(journal, "{line}")?;
-            journal.flush()?;
-            println!("{line}");
-            seq = new_seq;
-            challenge = challenge.checked_add(1).context("Challenge overflow")?;
         }
     }.await;
     conn.close(0, "Position session ended; do not auto-resume motion");
     journal.sync_all()?;
-    eprintln!("Session ended after {seq} accepted samples");
+    eprintln!("Session ended after {delivered} delivered samples (last sequence {seq})");
     outcome
 }
 
@@ -323,7 +379,7 @@ async fn publish(
     .await??;
     tls::address(raw.remote_address(), insecure_lan)?;
     let conn = kynet::Connection::from(raw);
-    let (mut send, mut recv) = conn.open_bi().await?;
+    let (mut send, _recv) = conn.open_bi().await?;
     // QUIC streams become visible to the receiver after their first byte.
     // Send a protocol marker before waiting for the first server challenge.
     send.write_all(b"P").await?;
@@ -331,14 +387,32 @@ async fn publish(
     let mut interval = tokio::time::interval(Duration::from_secs_f64(1.0 / hz as f64));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut seq = 0;
+    let mut challenge = None;
     let outcome: Result<()> = async {
         loop {
+            tokio::select! {
+                result = conn.read_datagram() => {
+                    let beacon = result?;
+                    ensure!(beacon.len() == 8, "Invalid challenge datagram");
+                    let nonce = u64::from_be_bytes(beacon[..].try_into()?);
+                    if challenge.is_none_or(|(previous, _)| nonce > previous) {
+                        challenge = Some((nonce, Instant::now()));
+                    }
+                    continue;
+                }
+                _ = interval.tick() => {}
+            }
             if seconds.is_some_and(|s| start.elapsed().as_secs_f64() >= s) {
                 break;
             }
-            let mut nonce = [0u8; 8];
-            tokio::time::timeout(Duration::from_secs(2), recv.read_exact(&mut nonce)).await??;
-            interval.tick().await;
+            let Some((nonce, received)) = challenge else {
+                ensure!(start.elapsed() <= DEADLINE, "No server freshness challenge");
+                continue;
+            };
+            ensure!(
+                received.elapsed() <= DEADLINE,
+                "Server freshness challenge expired"
+            );
             let sample = if simulate {
                 let t = start.elapsed().as_secs_f64();
                 Sample {
@@ -370,19 +444,14 @@ async fn publish(
                 "Leader sample older than 100 ms; refusing stale input"
             );
             seq += 1;
-            let frame = encode(u64::from_be_bytes(nonce), seq, &sample)?;
-            tokio::time::timeout(DEADLINE, send.write_all(&frame)).await??;
+            let frame = encode(nonce, seq, &sample)?;
+            conn.send_datagram(bytes::Bytes::from(frame)).await?;
         }
         Ok(())
     }
     .await;
-    // Wait for the last frame to be accepted before closing.
-    if outcome.is_ok() && seq > 0 {
-        let mut acknowledgement = [0; 8];
-        tokio::time::timeout(DEADLINE, recv.read_exact(&mut acknowledgement)).await??;
-        let mut stop = [0; FRAME_LEN];
-        stop[..8].copy_from_slice(&acknowledgement);
-        tokio::time::timeout(DEADLINE, send.write_all(&stop)).await??;
+    if outcome.is_ok() {
+        tokio::time::timeout(DEADLINE, send.write_all(b"S")).await??;
         tokio::time::timeout(Duration::from_secs(1), conn.closed()).await??;
     }
     if let Err(error) = &outcome {
@@ -456,6 +525,34 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pipelined_challenges_retain_the_200_ms_expiry() {
+        let mut challenges = Challenges::default();
+        let start = Instant::now();
+        let first = challenges.issue(start).unwrap();
+        let next = challenges.issue(start + Duration::from_millis(20)).unwrap();
+        assert!(
+            challenges
+                .age(first, start + Duration::from_millis(199))
+                .is_some()
+        );
+        assert!(
+            challenges
+                .age(first, start + Duration::from_millis(201))
+                .is_none()
+        );
+        assert!(
+            challenges
+                .age(next, start + Duration::from_millis(201))
+                .is_some()
+        );
+        assert!(
+            challenges
+                .age(999, start + Duration::from_millis(201))
+                .is_none()
+        );
+    }
+
     #[test]
     fn native_actions_preserve_signed_fractional_units_and_order() {
         let sample = Sample {

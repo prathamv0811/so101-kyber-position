@@ -18,7 +18,7 @@ and motor writes. Video uses GStreamer H.264 and Kyber's KyProto datagram stream
 There is no LeRobot camera/network transport in the remote path.
 
 Both arms use `use_degrees=True`: body actions are degrees and the gripper is
-0..100, exactly as in LeRobot. Protocol v3 carries the six `.pos` values as
+0..100, exactly as in LeRobot. The native action format carries the six `.pos` values as
 64-bit floats and reconstructs the same action dictionary. It replaces the old
 calibrated-fraction/gamepad protocol and relative leader anchor. Both computers
 must update and rebuild. A fixed leader pose now remains an absolute target;
@@ -50,3 +50,10 @@ verify signed fractional values across real Kyber QUIC connections.
 
 Control requests default to 120 Hz on reader, client, and server. Video stays
 30 fps. Logs report actual follower update rate. See [remote setup](tailscale.md).
+
+Transport v4 uses one QUIC datagram per action through KyNet, with independent
+20 ms challenge beacons that expire after 200 ms. Publishing no longer waits for
+one network round trip per action. The receiver and hardware pipe keep only the
+newest available command; sequence gaps are expected after loss or coalescing.
+The action journal keeps `version: 3` for native units and adds `transport_version: 4`.
+Higher sample rate does not raise the reviewed per-second motion limit.
