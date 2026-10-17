@@ -276,5 +276,10 @@ A frame echoing the current challenge with all remaining bytes zero explicitly
 ends a position session. Both read and publish rates must be 10–120 Hz to stay
 within the watchdog budget; the default is 30 Hz.
 
+Before a live session, the publisher waits up to 30 seconds for LeRobot's first
+sample, allowing imports and USB startup to finish before connecting. The
+follower also waits torque-off for its first fresh sample and anchors to its
+measured pose at that point. The 200 ms live watchdog remains unchanged.
+
 See [LICENSE](LICENSE) for the project's AGPL-3.0-or-later license; upstream SDK
 components retain their own license notices.

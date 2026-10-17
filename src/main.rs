@@ -255,33 +255,6 @@ async fn publish(
         seconds.is_none_or(|s| s.is_finite() && s > 0.0),
         "Invalid duration"
     );
-    let mut tls = rustls::ClientConfig::builder()
-        .with_root_certificates(roots(credentials)?)
-        .with_client_auth_cert(
-            certs(&credentials.join("cert.pem"))?,
-            key(&credentials.join("key.pem"))?,
-        )?;
-    tls.alpn_protocols = vec![ALPN.to_vec()];
-    let mut config = quinn::ClientConfig::new(Arc::new(
-        quinn::crypto::rustls::QuicClientConfig::try_from(tls)?,
-    ));
-    config.transport_config(transport());
-    let bind = if remote.is_ipv4() {
-        "0.0.0.0:0"
-    } else {
-        "[::]:0"
-    };
-    let endpoint = quinn::Endpoint::client(bind.parse()?)?;
-    let raw = tokio::time::timeout(
-        Duration::from_secs(5),
-        endpoint.connect_with(config, remote, server_name)?,
-    )
-    .await??;
-    let conn = kynet::Connection::from(raw);
-    let (mut send, mut recv) = conn.open_bi().await?;
-    // QUIC streams become visible to the receiver after their first byte.
-    // Send a protocol marker before waiting for the first server challenge.
-    send.write_all(b"P").await?;
     let (source_tx, mut source_rx) = tokio::sync::watch::channel::<Option<Sample>>(None);
     // A detached OS reader allows shutdown even if terminal stdin remains blocked.
     // A watch channel keeps only the newest sample, avoiding a motion-command backlog.
@@ -314,6 +287,41 @@ async fn publish(
             }
         });
     }
+    let mut tls = rustls::ClientConfig::builder()
+        .with_root_certificates(roots(credentials)?)
+        .with_client_auth_cert(
+            certs(&credentials.join("cert.pem"))?,
+            key(&credentials.join("key.pem"))?,
+        )?;
+    tls.alpn_protocols = vec![ALPN.to_vec()];
+    let mut config = quinn::ClientConfig::new(Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(tls)?,
+    ));
+    config.transport_config(transport());
+    let bind = if remote.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
+    let endpoint = quinn::Endpoint::client(bind.parse()?)?;
+    // LeRobot imports/USB handshake can take seconds. Wait for the first
+    // source sample BEFORE connecting, while no live watchdog/session exists.
+    if !simulate && source_rx.borrow().is_none() {
+        eprintln!("Waiting up to 30 seconds for the LeRobot leader source");
+        tokio::time::timeout(Duration::from_secs(30), source_rx.changed())
+            .await
+            .context("Leader did not initialize within 30 seconds")??;
+    }
+    let raw = tokio::time::timeout(
+        Duration::from_secs(5),
+        endpoint.connect_with(config, remote, server_name)?,
+    )
+    .await??;
+    let conn = kynet::Connection::from(raw);
+    let (mut send, mut recv) = conn.open_bi().await?;
+    // QUIC streams become visible to the receiver after their first byte.
+    // Send a protocol marker before waiting for the first server challenge.
+    send.write_all(b"P").await?;
     let start = Instant::now();
     let mut interval = tokio::time::interval(Duration::from_secs_f64(1.0 / hz as f64));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);

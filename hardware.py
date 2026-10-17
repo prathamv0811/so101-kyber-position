@@ -212,6 +212,21 @@ def read_sample(timeout):
             raise ValueError("Oversized receiver record")
 
 
+def first_sample(timeout=30):
+    """Startup happens torque-off; skip queued old records before enable."""
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("No fresh leader sample during startup")
+        sample = read_sample(remaining)
+        age = time.time_ns() - sample["received_unix_ns"]
+        if 0 <= age <= 100_000_000:
+            return sample
+        if age < 0:
+            raise ValueError("Receiver timestamp is in the future")
+
+
 def drive(args):
     if not (args.enable_motion and args.attended):
         raise ValueError("Physical operation requires --attended --enable-motion")
@@ -228,9 +243,10 @@ def drive(args):
     try:
         bus.require_passive()
         verify_calibration(bus, fc)
+        print("Follower ready; waiting up to 30 seconds for the leader (torque off)", file=sys.stderr)
+        first = first_sample()
         initial = bus.positions()
         controller = PositionController(config, lc, fc, initial)
-        first = read_sample(0.2)
         controller.target(first, initial)  # Validate fresh input and anchor before torque.
         touched = True
         for motor, position in zip(bus.ids, initial):

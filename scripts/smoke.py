@@ -55,6 +55,29 @@ def main():
             assert [r["seq"] for r in records] == list(range(1, len(records) + 1))
             assert all(len(r["positions"]) == 6 and all(0 <= p <= 4095 for p in r["positions"]) for r in records)
 
+            # Model delayed LeRobot imports/USB initialization before its first sample.
+            address, server, output = receiver("slow-source")
+            client = start("slow-source-client", [BIN, "publish", "--remote", address,
+                "--credentials", creds / "leader", "--seconds", "0.8"], stdin=subprocess.PIPE)
+            time.sleep(0.5)
+            assert client.poll() is None
+            deadline = time.monotonic() + 2
+            while client.poll() is None and time.monotonic() < deadline:
+                sample = {"captured_unix_ns": time.time_ns(), "positions": [2048] * 6}
+                try:
+                    client.stdin.write((json.dumps(sample) + "\n").encode())
+                    client.stdin.flush()
+                except BrokenPipeError:
+                    break
+                time.sleep(1 / 30)
+            assert client.wait(4) == 0, (root / "slow-source-client.log").read_text()
+            try:
+                client.stdin.close()
+            except BrokenPipeError:
+                pass
+            assert server.wait(3) == 0
+            assert len(output.read_text().splitlines()) >= 15
+
             address, server, output = receiver("stale")
             client = start("stale-client", [BIN, "publish", "--remote", address,
                 "--credentials", creds / "leader"], stdin=subprocess.PIPE)
@@ -116,6 +139,7 @@ def main():
             print(json.dumps({"passed": True, "sdk": "0.29.0", "position_samples": len(records),
                 "six_joints_atomic": True, "stale_samples_rejected": True,
                 "publisher_loss_watchdog": True, "untrusted_peer_rejected": True,
+                "delayed_lerobot_startup": True,
                 "gstreamer_video_frames": frame_count, "gstreamer_decode": True,
                 "video_transport": "KyProto GopStream H.264",
                 "concurrent_control_samples": concurrent_samples,
