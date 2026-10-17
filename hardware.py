@@ -206,8 +206,8 @@ def leader(args):
 class LeRobotControls:
     """Freshness/physical-limit guard around LeRobot's native absolute actions.
 
-    LeRobot ensure_safe_goal_position provides the goal step limiter; the actual
-    SO101Follower applies max_relative_target and writes through send_action.
+    A per-second ramp is optional. The measured-position tracking bound remains
+    enforced by both this wrapper and SO101Follower.max_relative_target.
     """
     def __init__(self, config, follower_cal, measured):
         if config.get("limits_reviewed") is not True:
@@ -219,16 +219,21 @@ class LeRobotControls:
         positions = action_to_ticks(validate_action(measured), self.cal)
         self.units_per_tick = {}
         self.tracking_limits = {}
+        self.speeds = {}
         for name, motor, position in zip(JOINTS, self.cal, positions):
             limit = self.limits[name]
             lo, hi, speed = limit["min_ticks"], limit["max_ticks"], limit["max_ticks_per_second"]
+            if speed is not None and not (type(speed) in (int, float) and math.isfinite(speed) and 0 < speed <= 1000):
+                raise ValueError(f"Invalid speed limit for {name}")
+            tracking = limit.get("max_tracking_error_ticks", max(2.0, speed * 0.1) if speed is not None else None)
             if not (type(lo) is int and type(hi) is int and motor["range_min"] <= lo < hi <= motor["range_max"]
-                    and lo <= position <= hi and type(speed) in (int, float) and math.isfinite(speed)
-                    and 0 < speed <= 1000 and limit["invert"] is False):
+                    and lo <= position <= hi and type(tracking) in (int, float) and math.isfinite(tracking)
+                    and 0 < tracking <= 100 and limit["invert"] is False):
                 raise ValueError(f"Invalid physical limits for {name}; native SO-101 actions require invert=false")
             unit = 100 / (motor["range_max"] - motor["range_min"]) if name == "gripper" else 360 / 4095
             self.units_per_tick[name] = unit
-            self.tracking_limits[name] = max(2.0, speed * 0.1) * unit
+            self.tracking_limits[name] = tracking * unit
+            self.speeds[name] = speed
         self.lower = ticks_to_action([self.limits[j]["min_ticks"] for j in JOINTS], self.cal)
         self.upper = ticks_to_action([self.limits[j]["max_ticks"] for j in JOINTS], self.cal)
         self.command = dict(measured)
@@ -254,8 +259,14 @@ class LeRobotControls:
             if abs(self.command[key] - measured[key]) > self.tracking_limits[name] + self.units_per_tick[name]:
                 raise RuntimeError(f"Follower {name} tracking error exceeded bound")
             goal = max(self.lower[key], min(self.upper[key], desired[key]))
-            goals[key] = (goal, self.command[key])
-            steps[key] = self.limits[name]["max_ticks_per_second"] * dt * self.units_per_tick[name]
+            if self.speeds[name] is None:
+                # No elapsed-time speed ramp. Retain the same reviewed maximum
+                # target offset from measured position, also enforced by LeRobot.
+                goals[key] = (goal, measured[key])
+                steps[key] = self.tracking_limits[name]
+            else:
+                goals[key] = (goal, self.command[key])
+                steps[key] = self.speeds[name] * dt * self.units_per_tick[name]
         self.command = ensure_safe_goal_position(goals, steps)
         self.previous_seq, self.last = sample["seq"], now
         return dict(self.command)
@@ -346,11 +357,11 @@ def drive(args):
     # Validate reviewed config before opening any hardware.
     if config.get("limits_reviewed") is not True:
         raise ValueError("Physical limits have not been reviewed")
-    print("Motion speed limits (ticks/s): " + json.dumps({
-        name: config["joints"][name]["max_ticks_per_second"] for name in JOINTS}), file=sys.stderr)
     validation_pose = [(config["joints"][name]["min_ticks"] + config["joints"][name]["max_ticks"]) // 2
                        for name in JOINTS]
-    LeRobotControls(config, fc, ticks_to_action(validation_pose, fc))
+    validated = LeRobotControls(config, fc, ticks_to_action(validation_pose, fc))
+    print("Motion speed limits (ticks/s; null = no per-second cap): " + json.dumps(validated.speeds), file=sys.stderr)
+    print("Tracking bounds (native units): " + json.dumps(validated.tracking_limits), file=sys.stderr)
     bus = Bus(args.port, [m["id"] for m in fc], args.follower_calibration, "follower")
     touched = False
     try:

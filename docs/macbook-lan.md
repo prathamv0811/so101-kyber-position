@@ -128,6 +128,8 @@ latest actions at up to 120 Hz and the follower skips queued old samples. Video
 remains 30 fps. Actual throughput depends on USB, Wi-Fi, and scheduling. The
 motor log reports measured update rate, leader values, feedback, and targets
 once per second. Speed limits remain in ticks/second, independent of sample rate.
+`max_ticks_per_second: null` disables a joint's time-based ramp and requires an
+explicit `max_tracking_error_ticks`; calibrated position/tracking guards remain.
 
 Transport v4 carries native LeRobot body degrees and gripper 0..100. Update and
 rebuild both computers; older transport clients cannot connect. See

@@ -73,6 +73,35 @@ class ControllerTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 controls.target(sample, self.initial)
 
+    def test_no_speed_cap_uses_measured_position_guard_without_time_ramp(self):
+        for limit in self.config["joints"].values():
+            limit.update(max_ticks_per_second=None, max_tracking_error_ticks=10)
+        desired = ticks_to_action([3000] * 6, self.cal)
+        for elapsed in (0, .001, .04):
+            with patch("hardware.time.monotonic", return_value=10):
+                controls = LeRobotControls(self.config, self.cal, self.initial)
+            with patch("hardware.time.monotonic", return_value=10 + elapsed):
+                target = controls.target(self.sample(1, desired), self.initial)
+            self.assertEqual(action_to_ticks(target, self.cal), [2010] * 6)
+        # It keeps following measured position, without accumulating unsent goals.
+        measured = ticks_to_action([2009] * 6, self.cal)
+        self.assertEqual(action_to_ticks(controls.target(self.sample(2, desired), measured), self.cal), [2019] * 6)
+        with self.assertRaisesRegex(RuntimeError, "tracking error"):
+            controls.target(self.sample(3, desired), self.initial)
+
+    def test_no_speed_cap_requires_an_explicit_tracking_bound(self):
+        self.config["joints"]["shoulder_pan"]["max_ticks_per_second"] = None
+        with self.assertRaisesRegex(ValueError, "physical limits"):
+            LeRobotControls(self.config, self.cal, self.initial)
+
+    def test_uncapped_targets_still_respect_reviewed_position_bounds(self):
+        for limit in self.config["joints"].values():
+            limit.update(max_ticks_per_second=None, max_tracking_error_ticks=10)
+        measured = ticks_to_action([3998] * 6, self.cal)
+        controls = LeRobotControls(self.config, self.cal, measured)
+        target = controls.target(self.sample(1, ticks_to_action([4095] * 6, self.cal)), measured)
+        self.assertEqual(action_to_ticks(target, self.cal), [4000] * 6)
+
     def test_unreviewed_limits_and_custom_inversion_refused(self):
         self.config["limits_reviewed"] = False
         with self.assertRaises(ValueError):
@@ -123,6 +152,11 @@ class ControllerTests(unittest.TestCase):
                 os.close(write_fd)
 
     def test_input_loss_after_enable_disables_all_motors(self):
+        self.exercise_drive_fault()
+
+    def test_uncapped_input_loss_after_enable_disables_all_motors(self):
+        for limit in self.config["joints"].values():
+            limit.update(max_ticks_per_second=None, max_tracking_error_ticks=10)
         self.exercise_drive_fault()
 
     def test_video_loss_after_enable_disables_all_motors(self):

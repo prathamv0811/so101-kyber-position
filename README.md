@@ -103,8 +103,8 @@ follower waits torque-off for fresh input and both streams, preloads its current
 pose, enables torque explicitly, and approaches the absolute leader pose at the
 configured speed. `SO101Follower.send_action()` performs the motor writes and
 applies LeRobot's `max_relative_target` guard. A freshness/limits wrapper uses
-LeRobot's `ensure_safe_goal_position` to preserve the reviewed per-second speed
-limits, including sub-tick progress at 120 Hz.
+LeRobot's `ensure_safe_goal_position` for measured-position tracking bounds and
+an optional per-second speed ramp.
 
 UDP ports are **7445** for actions, **7446** for top video, and **7447** for wrist
 video. `--tailscale` requires no application credential files: access relies on
@@ -173,7 +173,14 @@ These software checks do not establish hardware stop performance.
 Increasing `--hz` does not change physical speed limits. For example, a configured
 100 ticks/s permits only about 8.8 degrees/s on body joints: a 45-degree leader
 movement takes at least 5.1 seconds to catch up. Review the per-joint
-`max_ticks_per_second` in the private follower profile separately. Motion logs
+`max_ticks_per_second` in the private follower profile separately. Set it to
+`null` to remove the per-second ramp, with an explicit `max_tracking_error_ticks`
+for each joint. The tracking bound limits target distance from measured position
+and remains enforced by `SO101Follower.max_relative_target`; it is not removed
+when disabling the speed ramp. For example, `max_ticks_per_second: null` and
+`max_tracking_error_ticks: 10` retain a 10-tick tracking bound without an
+elapsed-time speed cap. Calibrated bounds, stale-input checks, and disconnect
+stops still apply. Motion logs
 print the active speeds; Mac `leader.log` prints measured sampling rate and the
 maximum acquisition time each second.
 

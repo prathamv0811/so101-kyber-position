@@ -51,6 +51,19 @@ class LeRobotAdapterTests(unittest.TestCase):
                             with self.assertRaisesRegex(RuntimeError, "Only the follower"):
                                 bus.send_action(expected)
                             write.assert_not_called()
+                    if role == "follower":
+                        bus.arm.config.max_relative_target = {
+                            name: 10 * (100 / (data[name]["range_max"] - data[name]["range_min"])
+                                        if name == "gripper" else 360 / 4095) for name in JOINTS}
+                        desired = ticks_to_action([value + 100 for value in raw], bus.cal)
+                        with patch.object(bus.driver, "sync_read", return_value=reading), \
+                             patch.object(bus.driver, "sync_write") as guarded_write, \
+                             patch("lerobot.robots.utils.logging.warning"):
+                            guarded = bus.send_action(desired)
+                        guarded_write.assert_called_once()
+                        for name in JOINTS:
+                            self.assertAlmostEqual(guarded[f"{name}.pos"] - expected[f"{name}.pos"],
+                                                   bus.arm.config.max_relative_target[name])
                     # Saturation must not hide gripper register values beyond calibration.
                     reading["gripper"] = 100.0
                     with patch.object(bus.driver, "sync_read", return_value=reading), \

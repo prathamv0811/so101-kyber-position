@@ -22,11 +22,12 @@ Both arms use `use_degrees=True`: body actions are degrees and the gripper is
 64-bit floats and reconstructs the same action dictionary. It replaces the old
 calibrated-fraction/gamepad protocol and relative leader anchor. Both computers
 must update and rebuild. A fixed leader pose now remains an absolute target;
-the follower ramps toward it within reviewed bounds and speed limits.
+the follower approaches it within reviewed position/tracking bounds and any
+configured speed ramp.
 
 `hardware.py` has a small safety wrapper: it verifies calibration, rejects
 stale/malformed input, checks physical bounds, and uses LeRobot's own
-`ensure_safe_goal_position` to limit target changes per elapsed second.
+`ensure_safe_goal_position` to enforce tracking bounds and an optional speed ramp.
 `SO101Follower.send_action()` applies `max_relative_target` relative to measured
 position, then performs the actual motor write. Fractional goals accumulate so
 small safe steps do not stall inside the servo dead zone. There is no custom PID
@@ -57,3 +58,6 @@ one network round trip per action. The receiver and hardware pipe keep only the
 newest available command; sequence gaps are expected after loss or coalescing.
 The action journal keeps `version: 3` for native units and adds `transport_version: 4`.
 Higher sample rate does not raise the reviewed per-second motion limit.
+Setting a joint's `max_ticks_per_second` to `null` disables only its time-based
+ramp. An explicit `max_tracking_error_ticks` is required in that case; this
+measured-position guard and LeRobot's `max_relative_target` remain active.

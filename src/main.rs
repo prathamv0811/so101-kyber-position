@@ -257,8 +257,8 @@ async fn receive(
     let mut last_input = tokio::time::Instant::now();
     let mut beacons = tokio::time::interval(Duration::from_millis(20));
     beacons.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut interval = tokio::time::interval(Duration::from_secs_f64(1.0 / hz as f64));
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let period = Duration::from_secs_f64(1.0 / hz as f64);
+    let mut delivery_clock = tokio::time::Instant::now();
     let mut stop = [0];
     let outcome: Result<()> = async {
         loop {
@@ -289,7 +289,10 @@ async fn receive(
                     last_input = tokio::time::Instant::now();
                     pending = Some((new_seq, sample, now_ns(), age));
                 }
-                _ = interval.tick() => {
+                // Allow two closely spaced arrivals at the requested average rate.
+                // Independent publisher/receiver timers otherwise discard ordinary
+                // Wi-Fi or scheduler jitter even when input averages exactly hz.
+                _ = tokio::time::sleep_until(delivery_clock - period), if pending.is_some() => {
                     let Some((new_seq, sample, received, age)) = pending.take() else { continue; };
                     ensure!(now_ns().saturating_sub(received) <= 100_000_000, "Local action delivery stalled");
                     let record = serde_json::json!({"version":3,"transport_version":4,
@@ -300,6 +303,7 @@ async fn receive(
                     writeln!(journal, "{line}")?;
                     println!("{line}");
                     delivered += 1;
+                    delivery_clock = delivery_clock.max(tokio::time::Instant::now()) + period;
                 }
             }
         }
